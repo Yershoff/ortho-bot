@@ -43,7 +43,9 @@ from telegram.ext import (
 # ─────────────────────────── Настройки ───────────────────────────
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-DOCTOR_CHAT_ID = int(os.environ.get("DOCTOR_CHAT_ID", "0"))
+# ID чата врача. Можно переопределить переменной окружения DOCTOR_CHAT_ID,
+# а если её нет — используется значение ниже. Это не секрет, в отличие от токена.
+DOCTOR_CHAT_ID = int(os.environ.get("DOCTOR_CHAT_ID", "659762090"))
 DB_PATH = "ortho_bot.db"
 
 logging.basicConfig(
@@ -561,10 +563,9 @@ async def send_reminders(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 def main() -> None:
-    if not BOT_TOKEN or not DOCTOR_CHAT_ID:
+    if not BOT_TOKEN:
         raise SystemExit(
-            "Задайте переменные окружения BOT_TOKEN и DOCTOR_CHAT_ID.\n"
-            "Токен — у @BotFather, свой ID — у @userinfobot."
+            "Задайте переменную окружения BOT_TOKEN (токен — у @BotFather)."
         )
     init_db()
     app = Application.builder().token(BOT_TOKEN).build()
