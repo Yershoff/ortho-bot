@@ -48,6 +48,23 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 DOCTOR_CHAT_ID = int(os.environ.get("DOCTOR_CHAT_ID", "659762090"))
 DB_PATH = "ortho_bot.db"
 
+# Часовой пояс пациентов относительно UTC (3 = Москва).
+# Сервер хостинга может жить по UTC, поэтому считаем время сами.
+TZ_OFFSET_HOURS = int(os.environ.get("TZ_OFFSET_HOURS", "3"))
+# Тихие часы: уведомления отправляем только с 10:00 до 20:00 местного времени
+QUIET_FROM, QUIET_TO = 10, 20
+
+
+def now_local() -> datetime:
+    from datetime import timezone
+    return datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(
+        hours=TZ_OFFSET_HOURS
+    )
+
+
+def is_quiet_hours() -> bool:
+    return not (QUIET_FROM <= now_local().hour < QUIET_TO)
+
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO
 )
@@ -78,6 +95,14 @@ def init_db() -> None:
         cols = [r[1] for r in conn.execute("PRAGMA table_info(patients)")]
         if "appliance" not in cols:
             conn.execute("ALTER TABLE patients ADD COLUMN appliance TEXT")
+        # миграция: график смены элайнеров
+        for col, typ in [
+            ("alg_start", "TEXT"), ("alg_interval", "INTEGER"),
+            ("alg_total", "INTEGER"), ("alg_notified", "TEXT"),
+            ("installed_at", "TEXT"), ("followup_stage", "INTEGER DEFAULT 0"),
+        ]:
+            if col not in cols:
+                conn.execute(f"ALTER TABLE patients ADD COLUMN {col} {typ}")
         # связь "сообщение в чате врача -> пациент", чтобы reply уходил адресату
         conn.execute(
             """CREATE TABLE IF NOT EXISTS relay (
@@ -528,9 +553,11 @@ async def doctor_hint(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await update.message.reply_text(
         "Чтобы ответить пациенту, сделайте «Ответ» (reply) на его сообщение: "
         "свайп влево по сообщению пациента → написать текст → отправить.\n\n"
-        "Команды:\n"
+        "Команды (или нажмите «/» — появится меню с подсказками):\n"
         "/patients — список пациентов\n"
         "/setvisit ID ДД.ММ.ГГГГ ЧЧ:ММ — назначить визит\n"
+        "/aligners ID 14 20 — график элайнеров (каждые 14 дн., 20 капп)\n"
+        "/installed ID — брекеты установлены сегодня (вкл. сопровождение)\n"
         "/broadcast текст — рассылка всем пациентам\n"
         "/backup — получить копию базы данных"
     )
@@ -620,6 +647,170 @@ async def visit_response(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
 
 
+async def cmd_aligners(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/aligners ID ИНТЕРВАЛ ВСЕГО — график смены элайнеров.
+    Пример: /aligners 123456789 14 20 (смена каждые 14 дней, всего 20 капп,
+    капа №1 надета сегодня)."""
+    try:
+        chat_id = int(context.args[0])
+        interval = int(context.args[1])
+        total = int(context.args[2])
+        assert interval > 0 and total > 0
+    except (IndexError, ValueError, AssertionError):
+        await update.message.reply_text(
+            "Формат: /aligners ID ИНТЕРВАЛ_ДНЕЙ ВСЕГО_КАПП\n"
+            "Пример: /aligners 123456789 14 20\n"
+            "(капа №1 считается надетой сегодня)"
+        )
+        return
+    today = now_local().date().isoformat()
+    with db() as conn:
+        cur = conn.execute(
+            "UPDATE patients SET alg_start=?, alg_interval=?, alg_total=?, "
+            "alg_notified=? WHERE chat_id=?",
+            (today, interval, total, today, chat_id),
+        )
+    if cur.rowcount == 0:
+        await update.message.reply_text("Пациент с таким ID не найден.")
+        return
+    await update.message.reply_text(
+        f"✅ График задан: смена каждые {interval} дн., всего {total} капп. "
+        "Бот будет напоминать пациенту о каждой смене."
+    )
+    await context.bot.send_message(
+        chat_id,
+        f"📅 Врач задал ваш график элайнеров:\n"
+        f"• сегодня надеваем капу №1\n"
+        f"• смена — каждые {interval} дней\n"
+        f"• всего капп: {total}\n\n"
+        "Я напомню о каждой смене — ничего считать не нужно 😉",
+    )
+
+
+async def cmd_installed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/installed ID — пациенту сегодня установили брекеты, включить сопровождение."""
+    try:
+        chat_id = int(context.args[0])
+    except (IndexError, ValueError):
+        await update.message.reply_text(
+            "Формат: /installed ID\n"
+            "Отмечает, что пациенту сегодня установили брекеты — бот будет "
+            "сопровождать его сообщениями на 1-й, 3-й и 7-й день."
+        )
+        return
+    with db() as conn:
+        cur = conn.execute(
+            "UPDATE patients SET installed_at=?, followup_stage=0 WHERE chat_id=?",
+            (now_local().date().isoformat(), chat_id),
+        )
+    if cur.rowcount == 0:
+        await update.message.reply_text("Пациент с таким ID не найден.")
+        return
+    await update.message.reply_text(
+        "✅ Сопровождение включено: бот напишет пациенту на 1-й, 3-й и 7-й день."
+    )
+
+
+FOLLOWUP_MESSAGES = [
+    # (день, текст)
+    (1, "Добрый день! Вчера вам установили брекеты — как самочувствие? 🙂\n\n"
+        "Небольшая ноющая боль и непривычность — это нормально, зубы начали "
+        "двигаться. Ешьте мягкую пищу, а если что-то натирает — ортодонтический "
+        "воск в помощь.\n\nЕсли что-то беспокоит — просто напишите мне, "
+        "передам врачу."),
+    (3, "Как дела? 🦷 К третьему дню болезненность обычно начинает стихать.\n\n"
+        "Если боль наоборот усиливается или что-то колет щёку — отправьте фото "
+        "через меню «📷 Отправить фото врачу», врач посмотрит."),
+    (7, "Неделя с брекетами — поздравляю, самое непривычное позади! 🎉\n\n"
+        "Самое время проверить гигиену: ёршики и монопучковая щётка после еды, "
+        "ирригатор вечером. Загляните в «🛒 Что купить», если чего-то ещё нет.\n\n"
+        "Дальше — по плану: приёмы раз в 6–8 недель, врач всё расскажет."),
+]
+
+
+async def aligner_and_followup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Ежечасно: смена элайнеров и сопровождение после установки."""
+    if is_quiet_hours():
+        return
+    today = now_local().date()
+    with db() as conn:
+        # — элайнеры —
+        rows = conn.execute(
+            "SELECT chat_id, alg_start, alg_interval, alg_total, alg_notified "
+            "FROM patients WHERE alg_start IS NOT NULL"
+        ).fetchall()
+        for r in rows:
+            start = datetime.fromisoformat(r["alg_start"]).date()
+            days = (today - start).days
+            if days <= 0 or days % r["alg_interval"] != 0:
+                continue
+            if r["alg_notified"] == today.isoformat():
+                continue  # сегодня уже напоминали
+            cap = days // r["alg_interval"] + 1
+            try:
+                if cap < r["alg_total"]:
+                    await context.bot.send_message(
+                        r["chat_id"],
+                        f"😬 Сегодня меняем капу: надеваем <b>№{cap} из "
+                        f"{r['alg_total']}</b>. Так держать! 🎉",
+                        parse_mode="HTML",
+                    )
+                    conn.execute(
+                        "UPDATE patients SET alg_notified=? WHERE chat_id=?",
+                        (today.isoformat(), r["chat_id"]),
+                    )
+                elif cap == r["alg_total"]:
+                    await context.bot.send_message(
+                        r["chat_id"],
+                        f"😬 Сегодня надеваем <b>последнюю капу №{cap} из "
+                        f"{r['alg_total']}</b> — финишная прямая! 🏁",
+                        parse_mode="HTML",
+                    )
+                    conn.execute(
+                        "UPDATE patients SET alg_notified=? WHERE chat_id=?",
+                        (today.isoformat(), r["chat_id"]),
+                    )
+                else:  # график закончился
+                    await context.bot.send_message(
+                        r["chat_id"],
+                        "🎉 Ваш график элайнеров завершён! Врач расскажет о "
+                        "следующих шагах на приёме.",
+                    )
+                    conn.execute(
+                        "UPDATE patients SET alg_start=NULL, alg_notified=NULL "
+                        "WHERE chat_id=?",
+                        (r["chat_id"],),
+                    )
+                    await context.bot.send_message(
+                        DOCTOR_CHAT_ID,
+                        f"ℹ️ У пациента ID {r['chat_id']} закончился график "
+                        "элайнеров — пора планировать следующий этап.",
+                    )
+            except Exception as e:
+                log.warning("Элайнер-напоминание %s: %s", r["chat_id"], e)
+
+        # — сопровождение после установки —
+        rows = conn.execute(
+            "SELECT chat_id, installed_at, followup_stage FROM patients "
+            "WHERE installed_at IS NOT NULL AND followup_stage < ?",
+            (len(FOLLOWUP_MESSAGES),),
+        ).fetchall()
+        for r in rows:
+            installed = datetime.fromisoformat(r["installed_at"]).date()
+            days = (today - installed).days
+            stage = r["followup_stage"]
+            due_day, text = FOLLOWUP_MESSAGES[stage]
+            if days >= due_day:
+                try:
+                    await context.bot.send_message(r["chat_id"], text)
+                    conn.execute(
+                        "UPDATE patients SET followup_stage=? WHERE chat_id=?",
+                        (stage + 1, r["chat_id"]),
+                    )
+                except Exception as e:
+                    log.warning("Сопровождение %s: %s", r["chat_id"], e)
+
+
 async def cmd_patients(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     with db() as conn:
         rows = conn.execute(
@@ -677,7 +868,9 @@ async def cmd_setvisit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def send_reminders(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Ежедневная задача: напомнить всем, у кого визит завтра."""
-    now = datetime.now()
+    if is_quiet_hours():
+        return  # не беспокоим рано утром и поздно вечером
+    now = now_local()
     tomorrow_end = now + timedelta(hours=36)
     with db() as conn:
         rows = conn.execute(
@@ -712,13 +905,36 @@ async def send_reminders(context: ContextTypes.DEFAULT_TYPE) -> None:
 # ─────────────────────────── Запуск ───────────────────────────
 
 
+async def setup_commands(app: Application) -> None:
+    """Выпадающее меню команд: у врача — своё, у пациентов — только /start."""
+    from telegram import BotCommand, BotCommandScopeChat, BotCommandScopeDefault
+    await app.bot.set_my_commands(
+        [BotCommand("start", "Запустить бота")],
+        scope=BotCommandScopeDefault(),
+    )
+    try:
+        await app.bot.set_my_commands(
+            [
+                BotCommand("patients", "Список пациентов"),
+                BotCommand("setvisit", "Назначить визит: ID ДД.ММ.ГГГГ ЧЧ:ММ"),
+                BotCommand("aligners", "График элайнеров: ID интервал всего"),
+                BotCommand("installed", "Брекеты установлены сегодня: ID"),
+                BotCommand("broadcast", "Рассылка всем пациентам: текст"),
+                BotCommand("backup", "Скачать копию базы"),
+            ],
+            scope=BotCommandScopeChat(DOCTOR_CHAT_ID),
+        )
+    except Exception as e:
+        log.warning("Не удалось настроить меню врача: %s", e)
+
+
 def main() -> None:
     if not BOT_TOKEN:
         raise SystemExit(
             "Задайте переменную окружения BOT_TOKEN (токен — у @BotFather)."
         )
     init_db()
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(setup_commands).build()
 
     doctor = filters.Chat(DOCTOR_CHAT_ID)
     patient = ~doctor
@@ -728,6 +944,8 @@ def main() -> None:
     app.add_handler(CommandHandler("setvisit", cmd_setvisit, filters=doctor))
     app.add_handler(CommandHandler("broadcast", cmd_broadcast, filters=doctor))
     app.add_handler(CommandHandler("backup", cmd_backup, filters=doctor))
+    app.add_handler(CommandHandler("aligners", cmd_aligners, filters=doctor))
+    app.add_handler(CommandHandler("installed", cmd_installed, filters=doctor))
     app.add_handler(CallbackQueryHandler(visit_response, pattern=r"^visit:"))
     app.add_handler(MessageHandler(doctor & filters.REPLY, doctor_reply))
     app.add_handler(MessageHandler(doctor & ~filters.COMMAND, doctor_hint))
@@ -742,6 +960,8 @@ def main() -> None:
 
     # Ежечасная проверка напоминаний (простая и надёжная схема)
     app.job_queue.run_repeating(send_reminders, interval=3600, first=10)
+    # Элайнеры и сопровождение после установки — тоже ежечасно, с тихими часами
+    app.job_queue.run_repeating(aligner_and_followup_job, interval=3600, first=30)
     # Еженедельный бэкап базы врачу в Telegram (раз в 7 дней)
     app.job_queue.run_repeating(weekly_backup, interval=7 * 24 * 3600, first=60)
 
