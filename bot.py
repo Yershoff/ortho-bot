@@ -100,6 +100,15 @@ def init_db() -> None:
             ("alg_start", "TEXT"), ("alg_interval", "INTEGER"),
             ("alg_total", "INTEGER"), ("alg_notified", "TEXT"),
             ("installed_at", "TEXT"), ("followup_stage", "INTEGER DEFAULT 0"),
+            # ношение капп: сумма секунд за сегодня, отметка "надето с",
+            #   дата, за которую копится счётчик, флаг предупреждения
+            ("wear_today", "INTEGER DEFAULT 0"), ("wear_since", "TEXT"),
+            ("wear_date", "TEXT"), ("wear_warned", "TEXT"),
+            # стадия лечения: active | retainer ; напоминание про эластики
+            ("stage", "TEXT DEFAULT 'active'"),
+            ("elastics", "INTEGER DEFAULT 0"), ("elastics_date", "TEXT"),
+            # фото прогресса: дата последнего запроса селфи
+            ("last_progress", "TEXT"),
         ]:
             if col not in cols:
                 conn.execute(f"ALTER TABLE patients ADD COLUMN {col} {typ}")
@@ -313,14 +322,59 @@ APPLIANCE_KEYBOARD = InlineKeyboardMarkup(
     ]
 )
 
+# Базовое меню (для брекетов и по умолчанию)
 MENU_KEYBOARD = ReplyKeyboardMarkup(
     [
         ["❓ Частые вопросы", "📋 Памятка"],
         ["🛒 Что купить", "📅 Мой следующий визит"],
-        ["📷 Отправить фото врачу"],
+        ["📸 Фото прогресса", "📷 Отправить фото врачу"],
     ],
     resize_keyboard=True,
 )
+
+# Меню для элайнеров — добавлена кнопка учёта ношения капп
+MENU_ALIGNERS = ReplyKeyboardMarkup(
+    [
+        ["❓ Частые вопросы", "😬 Мои каппы"],
+        ["🛒 Что купить", "📅 Мой следующий визит"],
+        ["📸 Фото прогресса", "📷 Отправить фото врачу"],
+    ],
+    resize_keyboard=True,
+)
+
+# Меню для ретейнеров (после лечения)
+MENU_RETAINER = ReplyKeyboardMarkup(
+    [
+        ["❓ Частые вопросы", "📅 Мой следующий визит"],
+        ["📸 Фото прогресса", "📷 Отправить фото врачу"],
+    ],
+    resize_keyboard=True,
+)
+
+
+def menu_for(chat_id: int) -> ReplyKeyboardMarkup:
+    """Подбирает клавиатуру под стадию и тип аппарата пациента."""
+    try:
+        with db() as conn:
+            r = conn.execute(
+                "SELECT appliance, stage FROM patients WHERE chat_id=?",
+                (chat_id,),
+            ).fetchone()
+        if r and r["stage"] == "retainer":
+            return MENU_RETAINER
+        if r and r["appliance"] == "aligners":
+            return MENU_ALIGNERS
+    except Exception:
+        pass
+    return MENU_KEYBOARD
+
+# Картинки-иллюстрации к некоторым ответам.
+# Если файла нет рядом с ботом — ответ придёт просто текстом (бот не упадёт).
+FAQ_IMAGES: dict[str, str] = {
+    "food": "art/food.png",
+    "hygiene": "art/brushing.png",
+    "pain": "art/wax.png",
+}
 
 # ─────────────────────────── Хэндлеры пациента ───────────────────────────
 
@@ -328,6 +382,13 @@ MENU_KEYBOARD = ReplyKeyboardMarkup(
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     upsert_patient(update.effective_chat.id, user.full_name, user.username)
+    # приветственный баннер, если картинка на месте
+    if os.path.exists("art/banner.png"):
+        try:
+            with open("art/banner.png", "rb") as f:
+                await update.message.reply_photo(f)
+        except Exception:
+            pass
     await update.message.reply_text(
         f"Здравствуйте, {user.first_name}! 🦷\n\n"
         "Я бот-помощник вашего ортодонта. Могу:\n"
@@ -335,7 +396,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• подсказать, что купить для ухода за полостью рта\n"
         "• передать врачу фото, если вас что-то беспокоит\n"
         "• напомнить о визите",
-        reply_markup=MENU_KEYBOARD,
+        reply_markup=menu_for(update.effective_chat.id),
     )
     await update.message.reply_text(
         "Что вам установили?", reply_markup=APPLIANCE_KEYBOARD
@@ -359,6 +420,12 @@ async def appliance_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         parse_mode="HTML",
         disable_web_page_preview=True,
     )
+    if appliance == "aligners":
+        await query.message.reply_text(
+            "Для элайнеров я добавил кнопку «😬 Мои каппы» — отмечайте там, "
+            "когда снимаете и надеваете, чтобы следить за нормой ношения.",
+            reply_markup=menu_for(query.message.chat_id),
+        )
 
 
 async def show_shop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -399,6 +466,29 @@ async def faq_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     back = InlineKeyboardMarkup(
         [[InlineKeyboardButton("← К списку вопросов", callback_data="faq_list")]]
     )
+    # если к вопросу есть иллюстрация и файл на месте — шлём картинкой с подписью
+    img_path = FAQ_IMAGES.get(key)
+    if img_path and os.path.exists(img_path):
+        caption = f"<b>{title}</b>\n\n{text}"
+        # подпись к фото ограничена 1024 символами — если длиннее, шлём фото + текст
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
+        if len(caption) <= 1024:
+            with open(img_path, "rb") as f:
+                await context.bot.send_photo(
+                    query.message.chat_id, f, caption=caption,
+                    parse_mode="HTML", reply_markup=back,
+                )
+        else:
+            with open(img_path, "rb") as f:
+                await context.bot.send_photo(query.message.chat_id, f)
+            await context.bot.send_message(
+                query.message.chat_id, caption,
+                parse_mode="HTML", reply_markup=back,
+            )
+        return
     await query.edit_message_text(f"<b>{title}</b>\n\n{text}",
                                   parse_mode="HTML", reply_markup=back)
 
@@ -410,9 +500,19 @@ async def faq_back(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         [InlineKeyboardButton(title, callback_data=f"faq:{key}")]
         for key, (title, _) in FAQ.items()
     ]
-    await query.edit_message_text(
-        "Выберите вопрос:", reply_markup=InlineKeyboardMarkup(buttons)
-    )
+    markup = InlineKeyboardMarkup(buttons)
+    # если предыдущий ответ был картинкой — у сообщения нет текста, редактировать
+    # нельзя; удаляем его и шлём список заново
+    if query.message.photo:
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
+        await context.bot.send_message(
+            query.message.chat_id, "Выберите вопрос:", reply_markup=markup
+        )
+    else:
+        await query.edit_message_text("Выберите вопрос:", reply_markup=markup)
 
 
 async def show_memo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -447,11 +547,146 @@ async def show_visit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         )
 
 
+# ─── Счётчик ношения капп ───
+
+WEAR_GOAL_HOURS = 20  # цель ношения в сутки
+
+
+def _fmt_hm(seconds: int) -> str:
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    return f"{h} ч {m:02d} мин"
+
+
+def _roll_wear_day(conn, chat_id: int) -> None:
+    """Если наступил новый день — обнуляем дневной счётчик."""
+    today = now_local().date().isoformat()
+    r = conn.execute(
+        "SELECT wear_date FROM patients WHERE chat_id=?", (chat_id,)
+    ).fetchone()
+    if not r or r["wear_date"] != today:
+        conn.execute(
+            "UPDATE patients SET wear_today=0, wear_date=?, wear_warned=NULL "
+            "WHERE chat_id=?",
+            (today, chat_id),
+        )
+
+
+async def show_wear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Экран учёта ношения капп с кнопками надел/снял."""
+    chat_id = update.effective_chat.id
+    with db() as conn:
+        _roll_wear_day(conn, chat_id)
+        r = conn.execute(
+            "SELECT wear_today, wear_since FROM patients WHERE chat_id=?",
+            (chat_id,),
+        ).fetchone()
+    worn = r["wear_today"] or 0
+    if r["wear_since"]:
+        # сейчас надеты — прибавим текущий незакрытый интервал для показа
+        since = datetime.fromisoformat(r["wear_since"])
+        worn += int((now_local() - since).total_seconds())
+        status = "😬 Сейчас каппы <b>надеты</b>"
+        btn = InlineKeyboardButton("Снял каппы", callback_data="wear:off")
+    else:
+        status = "Каппы сейчас сняты"
+        btn = InlineKeyboardButton("Надел каппы", callback_data="wear:on")
+    goal = WEAR_GOAL_HOURS * 3600
+    pct = min(100, int(worn / goal * 100)) if goal else 0
+    bar = "▰" * (pct // 10) + "▱" * (10 - pct // 10)
+    await update.message.reply_text(
+        f"{status}\n\n"
+        f"Сегодня наношено: <b>{_fmt_hm(worn)}</b> из {WEAR_GOAL_HOURS} ч\n"
+        f"{bar} {pct}%\n\n"
+        "Отмечайте каждый раз, когда снимаете и надеваете каппы — "
+        "так мы видим, набирается ли норма 20–22 часа.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([[btn]]),
+    )
+
+
+async def wear_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    action = query.data.split(":", 1)[1]
+    chat_id = query.message.chat_id
+    with db() as conn:
+        _roll_wear_day(conn, chat_id)
+        r = conn.execute(
+            "SELECT wear_today, wear_since FROM patients WHERE chat_id=?",
+            (chat_id,),
+        ).fetchone()
+        if action == "on":
+            conn.execute(
+                "UPDATE patients SET wear_since=? WHERE chat_id=?",
+                (now_local().isoformat(), chat_id),
+            )
+            msg = "Отметил: каппы надеты 😬 Счётчик пошёл."
+        else:  # off
+            worn = r["wear_today"] or 0
+            if r["wear_since"]:
+                since = datetime.fromisoformat(r["wear_since"])
+                worn += int((now_local() - since).total_seconds())
+            conn.execute(
+                "UPDATE patients SET wear_today=?, wear_since=NULL WHERE chat_id=?",
+                (worn, chat_id),
+            )
+            msg = f"Отметил: каппы сняты. Сегодня уже {_fmt_hm(worn)}."
+    try:
+        await query.edit_message_reply_markup(None)
+    except Exception:
+        pass
+    await query.message.reply_text(msg, reply_markup=menu_for(chat_id))
+
+
+# ─── Фото прогресса ───
+
+async def ask_progress_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data["awaiting_progress"] = True
+    await update.message.reply_text(
+        "📸 Сделайте селфи улыбки — покрупнее, чтобы были видны зубы.\n\n"
+        "Я сохраню его с сегодняшней датой, и со временем вы сможете "
+        "наблюдать, как меняется ваша улыбка. Это здорово мотивирует! 😊\n\n"
+        "Просто пришлите фото следующим сообщением."
+    )
+
+
 async def relay_to_doctor(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Фото или текстовый вопрос пациента -> в чат врача."""
     user = update.effective_user
     chat_id = update.effective_chat.id
     upsert_patient(chat_id, user.full_name, user.username)
+
+    # фото прогресса — отдельный поток: сохраняем у врача с меткой даты
+    if update.message.photo and context.user_data.get("awaiting_progress"):
+        context.user_data["awaiting_progress"] = False
+        today = now_local().strftime("%d.%m.%Y")
+        with db() as conn:
+            conn.execute(
+                "UPDATE patients SET last_progress=? WHERE chat_id=?",
+                (now_local().date().isoformat(), chat_id),
+            )
+        try:
+            await context.bot.send_photo(
+                DOCTOR_CHAT_ID,
+                update.message.photo[-1].file_id,
+                caption=f"📸 Фото прогресса — {user.full_name}, {today}",
+                parse_mode="HTML",
+            )
+        except Exception as e:
+            log.warning("Фото прогресса врачу: %s", e)
+        await update.message.reply_text(
+            "Сохранил ваше фото! 📸 Продолжайте в том же духе — "
+            "скоро будет с чем сравнить 😊",
+            reply_markup=menu_for(chat_id),
+        )
+        return
+
+    # тревожная подпись к фото — экстренный сценарий
+    caption_text = update.message.caption or ""
+    if caption_text and looks_emergency(caption_text):
+        await handle_emergency_photo(update, context)
+        return
 
     header = (
         f"📨 От пациента: <b>{user.full_name}</b>"
@@ -489,6 +724,81 @@ async def relay_to_doctor(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
 
 
+# Тревожные слова — при них бот сразу даёт срочный контакт, а не заготовку.
+EMERGENCY_WORDS = [
+    "сильная боль", "невыносим", "нестерпим", "проглотил", "проглотила",
+    "задыха", "отёк", "отек", "опухл", "температура", "кровотеч",
+    "кровь не останав", "аллерг", "не могу дышать", "обморок",
+    "проволока в горле", "застряла в горле",
+]
+
+# Телефон для экстренной связи (можно задать переменной окружения).
+EMERGENCY_PHONE = os.environ.get("EMERGENCY_PHONE", "")
+
+
+def looks_emergency(text: str) -> bool:
+    t = text.lower()
+    return any(w in t for w in EMERGENCY_WORDS)
+
+
+async def handle_emergency(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Пациент написал что-то тревожное — даём срочные инструкции и зовём врача."""
+    phone_line = (
+        f"\n\n📞 Срочная связь с клиникой: {EMERGENCY_PHONE}"
+        if EMERGENCY_PHONE else ""
+    )
+    await update.message.reply_text(
+        "⚠️ Похоже, ситуация серьёзная.\n\n"
+        "Если есть сильная боль, затруднённое дыхание, отёк, высокая "
+        "температура или вы что-то проглотили и вам плохо — не ждите ответа "
+        "в чате, свяжитесь с врачом напрямую или позвоните в скорую (103)."
+        + phone_line +
+        "\n\nЯ уже передал ваше сообщение врачу с пометкой «срочно».",
+    )
+    # врачу — с явной пометкой
+    user = update.effective_user
+    try:
+        await context.bot.send_message(
+            DOCTOR_CHAT_ID,
+            f"🚨 <b>СРОЧНО</b> — пациент <b>{user.full_name}</b>"
+            + (f" (@{user.username})" if user.username else "")
+            + f"\nID: <code>{update.effective_chat.id}</code>\n\n"
+            f"💬 {update.message.text}\n\n"
+            "↩️ Ответьте reply-ем, чтобы написать пациенту.",
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        log.warning("Не удалось отправить срочное врачу: %s", e)
+
+
+async def handle_emergency_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Фото с тревожной подписью — срочно врачу + инструкции пациенту."""
+    user = update.effective_user
+    phone_line = (
+        f"\n📞 Срочная связь: {EMERGENCY_PHONE}" if EMERGENCY_PHONE else ""
+    )
+    await update.message.reply_text(
+        "⚠️ Вижу, что дело серьёзное. Если вам плохо — не ждите ответа в чате, "
+        "свяжитесь с врачом напрямую или звоните 103." + phone_line +
+        "\n\nФото и сообщение уже отправлены врачу с пометкой «срочно»."
+    )
+    try:
+        sent = await context.bot.send_photo(
+            DOCTOR_CHAT_ID,
+            update.message.photo[-1].file_id,
+            caption=f"🚨 <b>СРОЧНО</b> — {user.full_name}"
+            + (f" (@{user.username})" if user.username else "")
+            + f"\nID: <code>{update.effective_chat.id}</code>\n\n"
+            f"{update.message.caption or ''}\n\n↩️ Ответьте reply-ем.",
+            parse_mode="HTML",
+        )
+        with db() as conn:
+            conn.execute("INSERT OR REPLACE INTO relay VALUES (?, ?)",
+                         (sent.message_id, update.effective_chat.id))
+    except Exception as e:
+        log.warning("Экстренное фото врачу: %s", e)
+
+
 async def patient_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Роутер текстовых сообщений пациента (кнопки меню / свободный вопрос)."""
     text = update.message.text
@@ -502,6 +812,13 @@ async def patient_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await ask_photo(update, context)
     elif text == "📅 Мой следующий визит":
         await show_visit(update, context)
+    elif text == "😬 Мои каппы":
+        await show_wear(update, context)
+    elif text == "📸 Фото прогресса":
+        await ask_progress_photo(update, context)
+    elif looks_emergency(text):
+        # экстренный сценарий имеет приоритет над обычной пересылкой
+        await handle_emergency(update, context)
     else:
         # свободный вопрос — пересылаем врачу
         await relay_to_doctor(update, context)
@@ -558,6 +875,8 @@ async def doctor_hint(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         "/setvisit ID ДД.ММ.ГГГГ ЧЧ:ММ — назначить визит\n"
         "/aligners ID 14 20 — график элайнеров (каждые 14 дн., 20 капп)\n"
         "/installed ID — брекеты установлены сегодня (вкл. сопровождение)\n"
+        "/elastics ID on — напоминания про эластики (или off)\n"
+        "/retainer ID — перевести в режим ретейнеров (лечение окончено)\n"
         "/broadcast текст — рассылка всем пациентам\n"
         "/backup — получить копию базы данных"
     )
@@ -711,6 +1030,78 @@ async def cmd_installed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     )
 
 
+async def cmd_retainer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/retainer ID — перевести пациента в режим ретейнеров (лечение окончено)."""
+    try:
+        chat_id = int(context.args[0])
+    except (IndexError, ValueError):
+        await update.message.reply_text(
+            "Формат: /retainer ID\n"
+            "Переводит пациента в режим ретейнеров: другие напоминания и меню, "
+            "график элайнеров и эластики отключаются."
+        )
+        return
+    with db() as conn:
+        cur = conn.execute(
+            "UPDATE patients SET stage='retainer', alg_start=NULL, "
+            "elastics=0 WHERE chat_id=?",
+            (chat_id,),
+        )
+    if cur.rowcount == 0:
+        await update.message.reply_text("Пациент с таким ID не найден.")
+        return
+    await update.message.reply_text(
+        "✅ Пациент переведён в режим ретейнеров. Бот будет напоминать носить "
+        "ретейнер и приходить на контроль."
+    )
+    try:
+        await context.bot.send_message(
+            chat_id,
+            "🎉 Поздравляем — активное лечение завершено!\n\n"
+            "Теперь начинается важный этап — ретейнеры. Носите их строго по "
+            "рекомендации врача, иначе зубы могут вернуться в прежнее положение.\n\n"
+            "Я буду периодически напоминать. Ваша улыбка это заслужила! 😁",
+            reply_markup=MENU_RETAINER,
+        )
+    except Exception:
+        pass
+
+
+async def cmd_elastics(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/elastics ID on|off — вкл/выкл ежедневные напоминания про эластики."""
+    try:
+        chat_id = int(context.args[0])
+        mode = context.args[1].lower()
+        assert mode in ("on", "off")
+    except (IndexError, ValueError, AssertionError):
+        await update.message.reply_text(
+            "Формат: /elastics ID on  (включить)  или  /elastics ID off\n"
+            "Включает ежедневное напоминание пациенту носить эластики (резинки)."
+        )
+        return
+    val = 1 if mode == "on" else 0
+    with db() as conn:
+        cur = conn.execute(
+            "UPDATE patients SET elastics=? WHERE chat_id=?", (val, chat_id)
+        )
+    if cur.rowcount == 0:
+        await update.message.reply_text("Пациент с таким ID не найден.")
+        return
+    await update.message.reply_text(
+        f"✅ Напоминания про эластики {'включены' if val else 'выключены'}."
+    )
+    if val:
+        try:
+            await context.bot.send_message(
+                chat_id,
+                "🎽 Врач подключил напоминания про эластики (резинки). "
+                "Я буду напоминать надевать их и менять на свежие — они теряют "
+                "упругость за день. Носим столько, сколько сказал врач!",
+            )
+        except Exception:
+            pass
+
+
 FOLLOWUP_MESSAGES = [
     # (день, текст)
     (1, "Добрый день! Вчера вам установили брекеты — как самочувствие? 🙂\n\n"
@@ -811,6 +1202,103 @@ async def aligner_and_followup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                     log.warning("Сопровождение %s: %s", r["chat_id"], e)
 
 
+async def daily_care_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Ежечасно: эластики (утро), ретейнер (раз в неделю), фото-прогресс
+    (раз в 2 недели), вечерний контроль ношения капп. Всё с тихими часами."""
+    if is_quiet_hours():
+        return
+    now = now_local()
+    today = now.date()
+    with db() as conn:
+        # — эластики: одно напоминание в день, в первый «рабочий» час (10:00) —
+        if now.hour == QUIET_FROM:
+            rows = conn.execute(
+                "SELECT chat_id FROM patients WHERE elastics=1 AND "
+                "(elastics_date IS NULL OR elastics_date!=?)", (today.isoformat(),)
+            ).fetchall()
+            for r in rows:
+                try:
+                    await context.bot.send_message(
+                        r["chat_id"],
+                        "🎽 Доброе утро! Не забудьте про эластики (резинки): "
+                        "наденьте свежие на сегодня. Носим столько часов, "
+                        "сколько назначил врач 💪",
+                    )
+                    conn.execute("UPDATE patients SET elastics_date=? WHERE chat_id=?",
+                                 (today.isoformat(), r["chat_id"]))
+                except Exception as e:
+                    log.warning("Эластики %s: %s", r["chat_id"], e)
+
+        # — вечерний контроль ношения капп (в 20-1=19ч по умолчанию) —
+        if now.hour == QUIET_TO - 1:
+            rows = conn.execute(
+                "SELECT chat_id, wear_today, wear_since, wear_date, wear_warned "
+                "FROM patients WHERE appliance='aligners' AND stage='active'"
+            ).fetchall()
+            for r in rows:
+                if r["wear_date"] != today.isoformat():
+                    continue  # сегодня не отмечали — не пилим
+                worn = r["wear_today"] or 0
+                if r["wear_since"]:
+                    since = datetime.fromisoformat(r["wear_since"])
+                    worn += int((now - since).total_seconds())
+                if worn < WEAR_GOAL_HOURS * 3600 and r["wear_warned"] != today.isoformat():
+                    try:
+                        await context.bot.send_message(
+                            r["chat_id"],
+                            f"⏰ Сегодня каппы наношены {_fmt_hm(worn)} — это меньше "
+                            f"нормы {WEAR_GOAL_HOURS} ч. Постарайтесь носить их "
+                            "почти всё время: от этого напрямую зависит срок лечения!",
+                        )
+                        conn.execute("UPDATE patients SET wear_warned=? WHERE chat_id=?",
+                                     (today.isoformat(), r["chat_id"]))
+                    except Exception as e:
+                        log.warning("Контроль ношения %s: %s", r["chat_id"], e)
+
+        # — ретейнер: напоминание раз в 7 дней (по понедельникам в 11:00) —
+        if now.weekday() == 0 and now.hour == 11:
+            rows = conn.execute(
+                "SELECT chat_id FROM patients WHERE stage='retainer'"
+            ).fetchall()
+            for r in rows:
+                try:
+                    await context.bot.send_message(
+                        r["chat_id"],
+                        "🦷 Еженедельное напоминание: носите ретейнер по графику! "
+                        "Это сохраняет результат лечения. Если ретейнер треснул "
+                        "или потерялся — сразу напишите мне.",
+                    )
+                except Exception as e:
+                    log.warning("Ретейнер %s: %s", r["chat_id"], e)
+
+        # — фото прогресса: просим раз в 14 дней (в 12:00) —
+        if now.hour == 12:
+            rows = conn.execute(
+                "SELECT chat_id, last_progress, stage FROM patients "
+                "WHERE stage IN ('active','retainer')"
+            ).fetchall()
+            for r in rows:
+                last = r["last_progress"]
+                due = (last is None) or (
+                    (today - datetime.fromisoformat(last).date()).days >= 14
+                )
+                if due:
+                    try:
+                        await context.bot.send_message(
+                            r["chat_id"],
+                            "📸 Пора для фото прогресса! Сделайте селфи улыбки "
+                            "через кнопку «📸 Фото прогресса» — сравним с прошлым "
+                            "разом и увидим, как продвигается лечение 😊",
+                        )
+                        # ставим метку, чтобы не спамить каждый час до присылки
+                        conn.execute(
+                            "UPDATE patients SET last_progress=? WHERE chat_id=?",
+                            (today.isoformat(), r["chat_id"]),
+                        )
+                    except Exception as e:
+                        log.warning("Фото-прогресс запрос %s: %s", r["chat_id"], e)
+
+
 async def cmd_patients(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     with db() as conn:
         rows = conn.execute(
@@ -901,6 +1389,73 @@ async def send_reminders(context: ContextTypes.DEFAULT_TYPE) -> None:
                 except Exception as e:  # пациент заблокировал бота и т.п.
                     log.warning("Не удалось напомнить %s: %s", r["chat_id"], e)
 
+        # — оценка визита: через 3 ч после визита, если ещё не спрашивали —
+        rows = conn.execute(
+            "SELECT chat_id, next_visit FROM patients "
+            "WHERE next_visit IS NOT NULL AND reminded=1"
+        ).fetchall()
+        for r in rows:
+            visit = datetime.fromisoformat(r["next_visit"])
+            if visit + timedelta(hours=3) <= now:
+                try:
+                    await context.bot.send_message(
+                        r["chat_id"],
+                        "Как прошёл сегодняшний приём? Оцените, пожалуйста 🙂",
+                        reply_markup=InlineKeyboardMarkup([[
+                            InlineKeyboardButton("⭐", callback_data="rate:1"),
+                            InlineKeyboardButton("⭐⭐", callback_data="rate:2"),
+                            InlineKeyboardButton("⭐⭐⭐", callback_data="rate:3"),
+                            InlineKeyboardButton("⭐⭐⭐⭐", callback_data="rate:4"),
+                            InlineKeyboardButton("⭐⭐⭐⭐⭐", callback_data="rate:5"),
+                        ]]),
+                    )
+                    # визит отработан: очищаем дату, сбрасываем флаг
+                    conn.execute(
+                        "UPDATE patients SET next_visit=NULL, reminded=0 "
+                        "WHERE chat_id=?", (r["chat_id"],),
+                    )
+                except Exception as e:
+                    log.warning("Запрос оценки %s: %s", r["chat_id"], e)
+
+
+# Ссылка на отзыв (Яндекс/2ГИС и т.п.) — задаётся переменной окружения.
+REVIEW_URL = os.environ.get("REVIEW_URL", "")
+
+
+async def rate_visit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Пациент оценил визит: 4–5 → просим отзыв, 1–3 → тихо врачу."""
+    query = update.callback_query
+    await query.answer()
+    score = int(query.data.split(":", 1)[1])
+    user = query.from_user
+    try:
+        await query.edit_message_reply_markup(None)
+    except Exception:
+        pass
+    if score >= 4:
+        text = "Спасибо большое! Очень рады 😊"
+        if REVIEW_URL:
+            text += (f"\n\nБудем признательны за отзыв — это очень помогает "
+                     f"клинике:\n{REVIEW_URL}")
+        await query.message.reply_text(text)
+    else:
+        await query.message.reply_text(
+            "Спасибо за честность. Мне жаль, что визит оставил вопросы — "
+            "я передал вашу оценку врачу, с вами свяжутся."
+        )
+    # врачу — всегда, для статистики и реакции на негатив
+    try:
+        await context.bot.send_message(
+            DOCTOR_CHAT_ID,
+            f"{'⭐'*score} Оценка визита от {user.full_name}"
+            + (f" (@{user.username})" if user.username else "")
+            + (f"\nID: <code>{query.message.chat_id}</code>"
+               if score < 4 else ""),
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        log.warning("Оценка врачу: %s", e)
+
 
 # ─────────────────────────── Запуск ───────────────────────────
 
@@ -919,6 +1474,8 @@ async def setup_commands(app: Application) -> None:
                 BotCommand("setvisit", "Назначить визит: ID ДД.ММ.ГГГГ ЧЧ:ММ"),
                 BotCommand("aligners", "График элайнеров: ID интервал всего"),
                 BotCommand("installed", "Брекеты установлены сегодня: ID"),
+                BotCommand("elastics", "Эластики вкл/выкл: ID on|off"),
+                BotCommand("retainer", "Перевести в режим ретейнеров: ID"),
                 BotCommand("broadcast", "Рассылка всем пациентам: текст"),
                 BotCommand("backup", "Скачать копию базы"),
             ],
@@ -946,6 +1503,8 @@ def main() -> None:
     app.add_handler(CommandHandler("backup", cmd_backup, filters=doctor))
     app.add_handler(CommandHandler("aligners", cmd_aligners, filters=doctor))
     app.add_handler(CommandHandler("installed", cmd_installed, filters=doctor))
+    app.add_handler(CommandHandler("retainer", cmd_retainer, filters=doctor))
+    app.add_handler(CommandHandler("elastics", cmd_elastics, filters=doctor))
     app.add_handler(CallbackQueryHandler(visit_response, pattern=r"^visit:"))
     app.add_handler(MessageHandler(doctor & filters.REPLY, doctor_reply))
     app.add_handler(MessageHandler(doctor & ~filters.COMMAND, doctor_hint))
@@ -955,13 +1514,17 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(appliance_chosen, pattern=r"^appl:"))
     app.add_handler(CallbackQueryHandler(faq_answer, pattern=r"^faq:"))
     app.add_handler(CallbackQueryHandler(faq_back, pattern=r"^faq_list$"))
+    app.add_handler(CallbackQueryHandler(wear_toggle, pattern=r"^wear:"))
+    app.add_handler(CallbackQueryHandler(rate_visit, pattern=r"^rate:"))
     app.add_handler(MessageHandler(patient & filters.PHOTO, relay_to_doctor))
     app.add_handler(MessageHandler(patient & filters.TEXT & ~filters.COMMAND, patient_text))
 
-    # Ежечасная проверка напоминаний (простая и надёжная схема)
+    # Ежечасная проверка напоминаний (визиты + оценка визита)
     app.job_queue.run_repeating(send_reminders, interval=3600, first=10)
     # Элайнеры и сопровождение после установки — тоже ежечасно, с тихими часами
     app.job_queue.run_repeating(aligner_and_followup_job, interval=3600, first=30)
+    # Эластики, ретейнеры, фото-прогресс, контроль ношения капп
+    app.job_queue.run_repeating(daily_care_job, interval=3600, first=45)
     # Еженедельный бэкап базы врачу в Telegram (раз в 7 дней)
     app.job_queue.run_repeating(weekly_backup, interval=7 * 24 * 3600, first=60)
 
