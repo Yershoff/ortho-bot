@@ -1418,8 +1418,12 @@ async def send_reminders(context: ContextTypes.DEFAULT_TYPE) -> None:
                     log.warning("Запрос оценки %s: %s", r["chat_id"], e)
 
 
-# Ссылка на отзыв (Яндекс/2ГИС и т.п.) — задаётся переменной окружения.
-REVIEW_URL = os.environ.get("REVIEW_URL", "")
+# Ссылка на отзыв (Яндекс/2ГИС/ПроДокторов и т.п.) — можно переопределить
+# переменной окружения REVIEW_URL, иначе используется значение ниже.
+REVIEW_URL = os.environ.get(
+    "REVIEW_URL",
+    "https://prodoctorov.ru/moskva/vrach/477724-abramkina/",
+)
 
 
 async def rate_visit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1433,11 +1437,14 @@ async def rate_visit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     except Exception:
         pass
     if score >= 4:
-        text = "Спасибо большое! Очень рады 😊"
+        text = "Спасибо большое! Очень рады, что визит понравился 😊"
         if REVIEW_URL:
-            text += (f"\n\nБудем признательны за отзыв — это очень помогает "
-                     f"клинике:\n{REVIEW_URL}")
-        await query.message.reply_text(text)
+            text += (
+                "\n\nБудем очень признательны, если оставите отзыв о враче — "
+                "это помогает другим пациентам и занимает пару минут:\n"
+                f"{REVIEW_URL}"
+            )
+        await query.message.reply_text(text, disable_web_page_preview=False)
     else:
         await query.message.reply_text(
             "Спасибо за честность. Мне жаль, что визит оставил вопросы — "
