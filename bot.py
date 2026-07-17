@@ -109,6 +109,8 @@ def init_db() -> None:
             ("elastics", "INTEGER DEFAULT 0"), ("elastics_date", "TEXT"),
             # фото прогресса: дата последнего запроса селфи
             ("last_progress", "TEXT"),
+            # последняя активность пациента (для «давно не появлялся»)
+            ("last_seen", "TEXT"),
         ]:
             if col not in cols:
                 conn.execute(f"ALTER TABLE patients ADD COLUMN {col} {typ}")
@@ -119,16 +121,27 @@ def init_db() -> None:
                    patient_chat_id INTEGER
                )"""
         )
+        # оценки визитов (для средней в /stats)
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS ratings (
+                   id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   chat_id INTEGER,
+                   score INTEGER,
+                   created_at TEXT
+               )"""
+        )
 
 
 def upsert_patient(chat_id: int, name: str, username: str | None) -> None:
+    now_iso = now_local().isoformat()
     with db() as conn:
         conn.execute(
-            """INSERT INTO patients (chat_id, name, username, created_at)
-               VALUES (?, ?, ?, ?)
+            """INSERT INTO patients (chat_id, name, username, created_at, last_seen)
+               VALUES (?, ?, ?, ?, ?)
                ON CONFLICT(chat_id) DO UPDATE SET name=excluded.name,
-                                                  username=excluded.username""",
-            (chat_id, name, username, datetime.now().isoformat()),
+                                                  username=excluded.username,
+                                                  last_seen=excluded.last_seen""",
+            (chat_id, name, username, now_iso, now_iso),
         )
 
 
@@ -337,7 +350,8 @@ MENU_ALIGNERS = ReplyKeyboardMarkup(
     [
         ["❓ Частые вопросы", "😬 Мои каппы"],
         ["🛒 Что купить", "📅 Мой следующий визит"],
-        ["📸 Фото прогресса", "📷 Отправить фото врачу"],
+        ["📸 Фото прогресса", "⚠️ Потерял/сломал"],
+        ["📷 Отправить фото врачу"],
     ],
     resize_keyboard=True,
 )
@@ -346,7 +360,8 @@ MENU_ALIGNERS = ReplyKeyboardMarkup(
 MENU_RETAINER = ReplyKeyboardMarkup(
     [
         ["❓ Частые вопросы", "📅 Мой следующий визит"],
-        ["📸 Фото прогресса", "📷 Отправить фото врачу"],
+        ["📸 Фото прогресса", "⚠️ Потерял/сломал"],
+        ["📷 Отправить фото врачу"],
     ],
     resize_keyboard=True,
 )
@@ -651,6 +666,67 @@ async def ask_progress_photo(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
 
 
+LOST_OPTIONS = {
+    "aligner_lost": "Потерял каппу (элайнер)",
+    "aligner_broke": "Сломал/треснул каппу",
+    "retainer_lost": "Потерял ретейнер",
+    "retainer_broke": "Сломал/треснул ретейнер",
+    "bracket": "Отклеился брекет / колет дуга",
+}
+
+
+async def report_lost(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Пациент сообщает о потере/поломке — показываем варианты."""
+    buttons = [
+        [InlineKeyboardButton(label, callback_data=f"lost:{key}")]
+        for key, label in LOST_OPTIONS.items()
+    ]
+    await update.message.reply_text(
+        "Что случилось? Выберите — я сразу передам врачу:",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
+async def lost_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    key = query.data.split(":", 1)[1]
+    label = LOST_OPTIONS.get(key, "проблема")
+    user = query.from_user
+    chat_id = query.message.chat_id
+
+    # совет пациенту в зависимости от проблемы
+    advice = {
+        "aligner_lost": "Наденьте предыдущую каппу, чтобы не терять прогресс, "
+                        "и дождитесь ответа врача.",
+        "aligner_broke": "Если каппа треснула, но надевается — носите её; если "
+                         "нет — наденьте предыдущую. Врач подскажет дальше.",
+        "retainer_lost": "Без ретейнера зубы могут сдвинуться — не тяните, врач "
+                         "свяжется с вами по поводу нового.",
+        "retainer_broke": "Если ретейнер ещё надевается — носите аккуратно; если "
+                          "нет — не носите сломанный, врач подскажет.",
+        "bracket": "Если дуга колет — прикройте воском. Сохраните брекет, если "
+                   "отклеился полностью.",
+    }.get(key, "")
+
+    await query.edit_message_text(
+        f"Передал врачу: «{label}» ✅\n\n{advice}\n\n"
+        "Врач свяжется с вами. Если нужно — можете отправить фото через меню."
+    )
+    try:
+        await context.bot.send_message(
+            DOCTOR_CHAT_ID,
+            f"⚠️ <b>{label}</b>\n"
+            f"Пациент: <b>{user.full_name}</b>"
+            + (f" (@{user.username})" if user.username else "")
+            + f"\nID: <code>{chat_id}</code>\n\n"
+            "↩️ Ответьте reply-ем, чтобы написать пациенту.",
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        log.warning("Сообщение о потере врачу: %s", e)
+
+
 async def relay_to_doctor(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Фото или текстовый вопрос пациента -> в чат врача."""
     user = update.effective_user
@@ -814,6 +890,8 @@ async def patient_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await show_visit(update, context)
     elif text == "😬 Мои каппы":
         await show_wear(update, context)
+    elif text == "⚠️ Потерял/сломал":
+        await report_lost(update, context)
     elif text == "📸 Фото прогресса":
         await ask_progress_photo(update, context)
     elif looks_emergency(text):
@@ -872,6 +950,8 @@ async def doctor_hint(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         "свайп влево по сообщению пациента → написать текст → отправить.\n\n"
         "Команды (или нажмите «/» — появится меню с подсказками):\n"
         "/patients — список пациентов\n"
+        "/find имя — найти пациента\n"
+        "/stats — статистика по пациентам\n"
         "/setvisit ID ДД.ММ.ГГГГ ЧЧ:ММ — назначить визит\n"
         "/aligners ID 14 20 — график элайнеров (каждые 14 дн., 20 капп)\n"
         "/installed ID — брекеты установлены сегодня (вкл. сопровождение)\n"
@@ -1319,6 +1399,115 @@ async def cmd_patients(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
+STAGE_LABELS = {
+    "active": "на лечении",
+    "retainer": "ретейнеры",
+}
+
+
+async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/stats — сводка по пациентам для врача."""
+    today = now_local().date()
+    with db() as conn:
+        total = conn.execute("SELECT COUNT(*) c FROM patients").fetchone()["c"]
+        braces = conn.execute(
+            "SELECT COUNT(*) c FROM patients WHERE appliance='braces'"
+        ).fetchone()["c"]
+        aligners = conn.execute(
+            "SELECT COUNT(*) c FROM patients WHERE appliance='aligners'"
+        ).fetchone()["c"]
+        retainer = conn.execute(
+            "SELECT COUNT(*) c FROM patients WHERE stage='retainer'"
+        ).fetchone()["c"]
+        with_visit = conn.execute(
+            "SELECT COUNT(*) c FROM patients WHERE next_visit IS NOT NULL"
+        ).fetchone()["c"]
+        # средняя оценка и количество
+        rr = conn.execute(
+            "SELECT COUNT(*) c, AVG(score) a FROM ratings"
+        ).fetchone()
+        ratings_count = rr["c"] or 0
+        avg = rr["a"]
+        # оценки за 30 дней
+        month_ago = (today - timedelta(days=30)).isoformat()
+        rr30 = conn.execute(
+            "SELECT COUNT(*) c, AVG(score) a FROM ratings WHERE created_at>=?",
+            (month_ago,),
+        ).fetchone()
+        # давно не появлялись (>30 дней), исключая ретейнеры
+        stale = conn.execute(
+            "SELECT name, username, chat_id, last_seen FROM patients "
+            "WHERE last_seen IS NOT NULL AND last_seen < ? AND stage!='retainer' "
+            "ORDER BY last_seen LIMIT 10",
+            (month_ago,),
+        ).fetchall()
+
+    lines = ["📊 <b>Статистика</b>\n"]
+    lines.append(f"Всего пациентов: <b>{total}</b>")
+    lines.append(f"• на брекетах: {braces}")
+    lines.append(f"• на элайнерах: {aligners}")
+    lines.append(f"• на ретейнерах: {retainer}")
+    lines.append(f"\nЗапланированы визиты: {with_visit}")
+    if ratings_count:
+        stars = "⭐" * round(avg)
+        lines.append(
+            f"\nСредняя оценка визитов: <b>{avg:.1f}</b> {stars} "
+            f"({ratings_count} оц.)"
+        )
+        if rr30["c"]:
+            lines.append(f"За 30 дней: {rr30['a']:.1f} ({rr30['c']} оц.)")
+    else:
+        lines.append("\nОценок визитов пока нет.")
+    if stale:
+        lines.append("\n😴 <b>Давно не появлялись (30+ дней):</b>")
+        for s in stale:
+            uname = f" @{s['username']}" if s["username"] else ""
+            try:
+                d = datetime.fromisoformat(s["last_seen"]).strftime("%d.%m.%Y")
+            except Exception:
+                d = "?"
+            lines.append(f"• {s['name']}{uname} — с {d} "
+                         f"(<code>{s['chat_id']}</code>)")
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
+async def cmd_find(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/find текст — поиск пациента по имени или @username."""
+    q = " ".join(context.args).strip()
+    if not q:
+        await update.message.reply_text(
+            "Формат: /find часть_имени\nПример: /find Иванова"
+        )
+        return
+    like = f"%{q.lstrip('@')}%"
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT chat_id, name, username, next_visit, appliance, stage "
+            "FROM patients WHERE name LIKE ? OR username LIKE ? ORDER BY name "
+            "LIMIT 20",
+            (like, like),
+        ).fetchall()
+    if not rows:
+        await update.message.reply_text(f"По запросу «{q}» никого не нашёл.")
+        return
+    lines = [f"🔎 <b>Найдено: {len(rows)}</b>\n"]
+    for r in rows:
+        uname = f" @{r['username']}" if r["username"] else ""
+        visit = (
+            datetime.fromisoformat(r["next_visit"]).strftime("%d.%m %H:%M")
+            if r["next_visit"] else "—"
+        )
+        stage = STAGE_LABELS.get(r["stage"] or "active", "")
+        appl = {"braces": "брекеты", "aligners": "элайнеры"}.get(
+            r["appliance"] or "", "—"
+        )
+        lines.append(
+            f"• {r['name']}{uname}\n"
+            f"  ID: <code>{r['chat_id']}</code> | {appl}, {stage} | визит: {visit}"
+        )
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
 async def cmd_setvisit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/setvisit CHAT_ID ДД.ММ.ГГГГ ЧЧ:ММ"""
     try:
@@ -1432,6 +1621,12 @@ async def rate_visit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await query.answer()
     score = int(query.data.split(":", 1)[1])
     user = query.from_user
+    # сохраняем оценку для статистики
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO ratings (chat_id, score, created_at) VALUES (?, ?, ?)",
+            (query.message.chat_id, score, now_local().isoformat()),
+        )
     try:
         await query.edit_message_reply_markup(None)
     except Exception:
@@ -1478,6 +1673,8 @@ async def setup_commands(app: Application) -> None:
         await app.bot.set_my_commands(
             [
                 BotCommand("patients", "Список пациентов"),
+                BotCommand("find", "Найти пациента: часть имени"),
+                BotCommand("stats", "Статистика по пациентам"),
                 BotCommand("setvisit", "Назначить визит: ID ДД.ММ.ГГГГ ЧЧ:ММ"),
                 BotCommand("aligners", "График элайнеров: ID интервал всего"),
                 BotCommand("installed", "Брекеты установлены сегодня: ID"),
@@ -1505,6 +1702,8 @@ def main() -> None:
 
     # Врач
     app.add_handler(CommandHandler("patients", cmd_patients, filters=doctor))
+    app.add_handler(CommandHandler("stats", cmd_stats, filters=doctor))
+    app.add_handler(CommandHandler("find", cmd_find, filters=doctor))
     app.add_handler(CommandHandler("setvisit", cmd_setvisit, filters=doctor))
     app.add_handler(CommandHandler("broadcast", cmd_broadcast, filters=doctor))
     app.add_handler(CommandHandler("backup", cmd_backup, filters=doctor))
@@ -1522,6 +1721,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(faq_answer, pattern=r"^faq:"))
     app.add_handler(CallbackQueryHandler(faq_back, pattern=r"^faq_list$"))
     app.add_handler(CallbackQueryHandler(wear_toggle, pattern=r"^wear:"))
+    app.add_handler(CallbackQueryHandler(lost_chosen, pattern=r"^lost:"))
     app.add_handler(CallbackQueryHandler(rate_visit, pattern=r"^rate:"))
     app.add_handler(MessageHandler(patient & filters.PHOTO, relay_to_doctor))
     app.add_handler(MessageHandler(patient & filters.TEXT & ~filters.COMMAND, patient_text))
