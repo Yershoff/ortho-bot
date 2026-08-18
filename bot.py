@@ -53,6 +53,8 @@ DB_PATH = "ortho_bot.db"
 TZ_OFFSET_HOURS = int(os.environ.get("TZ_OFFSET_HOURS", "3"))
 # Тихие часы: уведомления отправляем только с 10:00 до 20:00 местного времени
 QUIET_FROM, QUIET_TO = 10, 20
+# Час утренней сводки врачу (по местному времени). Переопределяется env.
+MORNING_BRIEF_HOUR = int(os.environ.get("MORNING_BRIEF_HOUR", "8"))
 
 
 def now_local() -> datetime:
@@ -952,6 +954,7 @@ async def doctor_hint(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         "/patients — список пациентов\n"
         "/find имя — найти пациента\n"
         "/stats — статистика по пациентам\n"
+        "/brief — сводка на сегодня (сама приходит по утрам)\n"
         "/setvisit ID ДД.ММ.ГГГГ ЧЧ:ММ — назначить визит\n"
         "/aligners ID 14 20 — график элайнеров (каждые 14 дн., 20 капп)\n"
         "/installed ID — брекеты установлены сегодня (вкл. сопровождение)\n"
@@ -1675,6 +1678,7 @@ async def setup_commands(app: Application) -> None:
                 BotCommand("patients", "Список пациентов"),
                 BotCommand("find", "Найти пациента: часть имени"),
                 BotCommand("stats", "Статистика по пациентам"),
+                BotCommand("brief", "Сводка на сегодня"),
                 BotCommand("setvisit", "Назначить визит: ID ДД.ММ.ГГГГ ЧЧ:ММ"),
                 BotCommand("aligners", "График элайнеров: ID интервал всего"),
                 BotCommand("installed", "Брекеты установлены сегодня: ID"),
@@ -1687,6 +1691,124 @@ async def setup_commands(app: Application) -> None:
         )
     except Exception as e:
         log.warning("Не удалось настроить меню врача: %s", e)
+
+
+async def morning_brief_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Раз в день утром шлёт врачу сводку: визиты сегодня, вчерашние оценки,
+    кто просит перенос, что требует внимания."""
+    now = now_local()
+    if now.hour != MORNING_BRIEF_HOUR:
+        return
+    # защита от повторной отправки в тот же день (если джоб дёрнется дважды)
+    flag = context.bot_data.get("brief_sent")
+    today = now.date().isoformat()
+    if flag == today:
+        return
+    context.bot_data["brief_sent"] = today
+
+    yesterday = (now.date() - timedelta(days=1)).isoformat()
+    with db() as conn:
+        # визиты на сегодня
+        visits = conn.execute(
+            "SELECT name, next_visit FROM patients WHERE next_visit IS NOT NULL "
+            "ORDER BY next_visit"
+        ).fetchall()
+        todays = []
+        for v in visits:
+            try:
+                dt = datetime.fromisoformat(v["next_visit"])
+                if dt.date() == now.date():
+                    todays.append((dt, v["name"]))
+            except Exception:
+                pass
+        # вчерашние оценки
+        rr = conn.execute(
+            "SELECT score FROM ratings WHERE created_at>=? AND created_at<?",
+            (yesterday, today),
+        ).fetchall()
+        # элайнер-пациенты, кто вчера недоносил каппы
+        low_wear = conn.execute(
+            "SELECT name FROM patients WHERE appliance='aligners' "
+            "AND stage='active' AND wear_warned=?", (yesterday,)
+        ).fetchall()
+
+    lines = [f"☀️ <b>Доброе утро! Сводка на {now.strftime('%d.%m')}</b>\n"]
+
+    # визиты
+    if todays:
+        lines.append(f"📅 <b>Визиты сегодня ({len(todays)}):</b>")
+        for dt, name in todays:
+            lines.append(f"• {dt.strftime('%H:%M')} — {name}")
+    else:
+        lines.append("📅 Визитов на сегодня нет.")
+
+    # оценки
+    if rr:
+        scores = [r["score"] for r in rr]
+        avg = sum(scores) / len(scores)
+        stars = "⭐" * round(avg)
+        lines.append(f"\n💬 Вчера оценок: {len(scores)} (средняя {avg:.1f} {stars})")
+        low = [s for s in scores if s < 4]
+        if low:
+            lines.append(f"⚠️ Из них низких (1–3): {len(low)} — проверьте /stats")
+
+    # недоношенные каппы
+    if low_wear:
+        names = ", ".join(w["name"] for w in low_wear)
+        lines.append(f"\n😬 Вчера недоносили каппы: {names}")
+
+    if len(lines) == 1:
+        lines.append("Спокойный день — ничего срочного 🙂")
+
+    lines.append("\n<i>Команды: /stats · /patients · /find</i>")
+
+    try:
+        await context.bot.send_message(
+            DOCTOR_CHAT_ID, "\n".join(lines), parse_mode="HTML"
+        )
+    except Exception as e:
+        log.warning("Утренняя сводка: %s", e)
+
+
+async def cmd_brief(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/brief — прислать сводку прямо сейчас (для проверки)."""
+    # временно сбросим дневной флаг и час, чтобы отработало по запросу
+    saved = context.bot_data.get("brief_sent")
+    context.bot_data["brief_sent"] = None
+    # соберём и отправим независимо от часа
+    now = now_local()
+    yesterday = (now.date() - timedelta(days=1)).isoformat()
+    today = now.date().isoformat()
+    with db() as conn:
+        visits = conn.execute(
+            "SELECT name, next_visit FROM patients WHERE next_visit IS NOT NULL "
+            "ORDER BY next_visit"
+        ).fetchall()
+        todays = []
+        for v in visits:
+            try:
+                dt = datetime.fromisoformat(v["next_visit"])
+                if dt.date() == now.date():
+                    todays.append((dt, v["name"]))
+            except Exception:
+                pass
+        rr = conn.execute(
+            "SELECT score FROM ratings WHERE created_at>=? AND created_at<?",
+            (yesterday, today),
+        ).fetchall()
+    lines = [f"☀️ <b>Сводка на {now.strftime('%d.%m')}</b> (по запросу)\n"]
+    if todays:
+        lines.append(f"📅 <b>Визиты сегодня ({len(todays)}):</b>")
+        for dt, name in todays:
+            lines.append(f"• {dt.strftime('%H:%M')} — {name}")
+    else:
+        lines.append("📅 Визитов на сегодня нет.")
+    if rr:
+        scores = [r["score"] for r in rr]
+        avg = sum(scores) / len(scores)
+        lines.append(f"\n💬 Вчера оценок: {len(scores)} (средняя {avg:.1f})")
+    context.bot_data["brief_sent"] = saved
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
 def main() -> None:
@@ -1703,6 +1825,7 @@ def main() -> None:
     # Врач
     app.add_handler(CommandHandler("patients", cmd_patients, filters=doctor))
     app.add_handler(CommandHandler("stats", cmd_stats, filters=doctor))
+    app.add_handler(CommandHandler("brief", cmd_brief, filters=doctor))
     app.add_handler(CommandHandler("find", cmd_find, filters=doctor))
     app.add_handler(CommandHandler("setvisit", cmd_setvisit, filters=doctor))
     app.add_handler(CommandHandler("broadcast", cmd_broadcast, filters=doctor))
@@ -1734,6 +1857,8 @@ def main() -> None:
     app.job_queue.run_repeating(daily_care_job, interval=3600, first=45)
     # Еженедельный бэкап базы врачу в Telegram (раз в 7 дней)
     app.job_queue.run_repeating(weekly_backup, interval=7 * 24 * 3600, first=60)
+    # Утренняя сводка врачу (проверяет час внутри, шлёт раз в день)
+    app.job_queue.run_repeating(morning_brief_job, interval=1800, first=50)
 
     log.info("Бот запущен 🦷")
     app.run_polling()
