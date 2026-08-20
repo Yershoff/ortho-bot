@@ -134,9 +134,13 @@ def init_db() -> None:
         )
 
 
-def upsert_patient(chat_id: int, name: str, username: str | None) -> None:
+def upsert_patient(chat_id: int, name: str, username: str | None) -> bool:
+    """Создаёт или обновляет пациента. Возвращает True, если пациент новый."""
     now_iso = now_local().isoformat()
     with db() as conn:
+        existed = conn.execute(
+            "SELECT 1 FROM patients WHERE chat_id=?", (chat_id,)
+        ).fetchone() is not None
         conn.execute(
             """INSERT INTO patients (chat_id, name, username, created_at, last_seen)
                VALUES (?, ?, ?, ?, ?)
@@ -145,6 +149,7 @@ def upsert_patient(chat_id: int, name: str, username: str | None) -> None:
                                                   last_seen=excluded.last_seen""",
             (chat_id, name, username, now_iso, now_iso),
         )
+    return not existed
 
 
 # ─────────────────────────── Контент ───────────────────────────
@@ -399,7 +404,23 @@ FAQ_IMAGES: dict[str, str] = {
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
-    upsert_patient(update.effective_chat.id, user.full_name, user.username)
+    is_new = upsert_patient(update.effective_chat.id, user.full_name, user.username)
+    # уведомляем врача о новом пациенте (только при первом запуске)
+    if is_new:
+        try:
+            await context.bot.send_message(
+                DOCTOR_CHAT_ID,
+                "🆕 <b>Новый пациент подключился к боту!</b>\n\n"
+                f"Имя: <b>{user.full_name}</b>"
+                + (f" (@{user.username})" if user.username else "")
+                + f"\nID: <code>{update.effective_chat.id}</code>\n\n"
+                "Можно сразу назначить визит:\n"
+                f"<code>/setvisit {update.effective_chat.id} "
+                "ДД.ММ.ГГГГ ЧЧ:ММ</code>",
+                parse_mode="HTML",
+            )
+        except Exception as e:
+            log.warning("Уведомление о новом пациенте: %s", e)
     # приветственный баннер, если картинка на месте
     if os.path.exists("art/banner.png"):
         try:
@@ -433,6 +454,16 @@ async def appliance_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
     label = "Брекеты 😁" if appliance == "braces" else "Элайнеры 😬"
     await query.edit_message_text(f"Отлично, записал: {label}")
+    # сообщаем врачу, что пациент указал тип аппарата
+    try:
+        await context.bot.send_message(
+            DOCTOR_CHAT_ID,
+            f"ℹ️ {query.from_user.full_name} указал(а) тип: <b>{label}</b>\n"
+            f"ID: <code>{query.message.chat_id}</code>",
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
     await query.message.reply_text(
         shop_text(appliance),
         parse_mode="HTML",
@@ -734,7 +765,20 @@ async def relay_to_doctor(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     """Фото или текстовый вопрос пациента -> в чат врача."""
     user = update.effective_user
     chat_id = update.effective_chat.id
-    upsert_patient(chat_id, user.full_name, user.username)
+    is_new = upsert_patient(chat_id, user.full_name, user.username)
+    if is_new:
+        # написал боту, минуя /start — тоже сообщаем врачу
+        try:
+            await context.bot.send_message(
+                DOCTOR_CHAT_ID,
+                "🆕 <b>Новый пациент в боте!</b>\n\n"
+                f"Имя: <b>{user.full_name}</b>"
+                + (f" (@{user.username})" if user.username else "")
+                + f"\nID: <code>{chat_id}</code>",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
 
     # фото прогресса — отдельный поток: сохраняем у врача с меткой даты
     if update.message.photo and context.user_data.get("awaiting_progress"):
