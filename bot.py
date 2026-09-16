@@ -1001,7 +1001,8 @@ async def doctor_hint(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         "/stats — статистика по пациентам\n"
         "/brief — сводка на сегодня (сама приходит по утрам)\n"
         "/setvisit ID ДД.ММ.ГГГГ ЧЧ:ММ — назначить визит\n"
-        "/aligners ID 14 20 — график элайнеров (каждые 14 дн., 20 капп)\n"
+        "/aligners ID — пациент выберет интервал смены (10/14 дней)\n"
+        "/aligners ID 14 — интервал задаёте вы\n"
         "/installed ID — брекеты установлены сегодня (вкл. сопровождение)\n"
         "/elastics ID on — напоминания про эластики (или off)\n"
         "/retainer ID — перевести в режим ретейнеров (лечение окончено)\n"
@@ -1095,43 +1096,99 @@ async def visit_response(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def cmd_aligners(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/aligners ID ИНТЕРВАЛ ВСЕГО — график смены элайнеров.
-    Пример: /aligners 123456789 14 20 (смена каждые 14 дней, всего 20 капп,
-    капа №1 надета сегодня)."""
+    """/aligners ID [ИНТЕРВАЛ] — напоминания о смене капп.
+    Без интервала пациент выбирает сам (10 или 14 дней)."""
     try:
         chat_id = int(context.args[0])
-        interval = int(context.args[1])
-        total = int(context.args[2])
-        assert interval > 0 and total > 0
+        interval = int(context.args[1]) if len(context.args) > 1 else None
+        assert interval is None or interval > 0
     except (IndexError, ValueError, AssertionError):
         await update.message.reply_text(
-            "Формат: /aligners ID ИНТЕРВАЛ_ДНЕЙ ВСЕГО_КАПП\n"
-            "Пример: /aligners 123456789 14 20\n"
-            "(капа №1 считается надетой сегодня)"
+            "Формат: /aligners ID [ИНТЕРВАЛ_ДНЕЙ]\n\n"
+            "• <code>/aligners 123456789</code>\n"
+            "  пациент сам выберет 10 или 14 дней\n\n"
+            "• <code>/aligners 123456789 14</code>\n"
+            "  интервал задаёте вы\n\n"
+            "(каппа №1 считается надетой сегодня)",
+            parse_mode="HTML",
         )
         return
+
     today = now_local().date().isoformat()
     with db() as conn:
         cur = conn.execute(
-            "UPDATE patients SET alg_start=?, alg_interval=?, alg_total=?, "
+            "UPDATE patients SET alg_start=?, alg_interval=?, alg_total=NULL, "
             "alg_notified=? WHERE chat_id=?",
-            (today, interval, total, today, chat_id),
+            (today, interval, today, chat_id),
         )
     if cur.rowcount == 0:
         await update.message.reply_text("Пациент с таким ID не найден.")
         return
-    await update.message.reply_text(
-        f"✅ График задан: смена каждые {interval} дн., всего {total} капп. "
-        "Бот будет напоминать пациенту о каждой смене."
+
+    if interval:
+        await update.message.reply_text(
+            f"✅ График задан: смена каждые {interval} дн. "
+            "Бот будет напоминать пациенту о каждой смене."
+        )
+        await context.bot.send_message(
+            chat_id,
+            f"📅 Врач задал ваш график:\n"
+            f"• сегодня надеваем каппу №1\n"
+            f"• смена — каждые {interval} дней\n\n"
+            "Я напомню о каждой смене — ничего считать не нужно 😉",
+        )
+    else:
+        await update.message.reply_text(
+            "✅ Пациенту отправлен выбор интервала (10 или 14 дней) — "
+            "сообщу, что он выберет."
+        )
+        await context.bot.send_message(
+            chat_id,
+            "📅 Врач назначил вам курс элайнеров.\n\n"
+            "Выберите, как часто вы будете менять каппы — "
+            "врач согласовал оба варианта:",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("10 дней", callback_data="alginterval:10"),
+                InlineKeyboardButton("14 дней", callback_data="alginterval:14"),
+            ]]),
+        )
+
+
+async def aligner_interval_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Пациент выбрал интервал смены капп."""
+    query = update.callback_query
+    await query.answer()
+    interval = int(query.data.split(":", 1)[1])
+    chat_id = query.message.chat_id
+    today = now_local().date()
+
+    with db() as conn:
+        conn.execute(
+            "UPDATE patients SET alg_interval=?, alg_start=?, alg_notified=? "
+            "WHERE chat_id=?",
+            (interval, today.isoformat(), today.isoformat(), chat_id),
+        )
+
+    next_change = today + timedelta(days=interval)
+    await query.edit_message_text(
+        f"✅ Готово! Ваш график:\n\n"
+        f"• сегодня надеваем каппу <b>№1</b>\n"
+        f"• меняем каждые <b>{interval} дней</b>\n"
+        f"• следующая смена: <b>{next_change.strftime('%d.%m.%Y')}</b>\n\n"
+        "Я напомню о каждой смене — считать ничего не нужно 😉\n"
+        "Главное: носить 20–22 часа в сутки!",
+        parse_mode="HTML",
     )
-    await context.bot.send_message(
-        chat_id,
-        f"📅 Врач задал ваш график элайнеров:\n"
-        f"• сегодня надеваем капу №1\n"
-        f"• смена — каждые {interval} дней\n"
-        f"• всего капп: {total}\n\n"
-        "Я напомню о каждой смене — ничего считать не нужно 😉",
-    )
+    try:
+        await context.bot.send_message(
+            DOCTOR_CHAT_ID,
+            f"😬 <b>{query.from_user.full_name}</b> выбрал(а) интервал смены "
+            f"капп: <b>{interval} дней</b>\n"
+            f"ID: <code>{chat_id}</code>",
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        log.warning("Уведомление о выборе интервала: %s", e)
 
 
 async def cmd_installed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1256,7 +1313,7 @@ async def aligner_and_followup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         # — элайнеры —
         rows = conn.execute(
             "SELECT chat_id, alg_start, alg_interval, alg_total, alg_notified "
-            "FROM patients WHERE alg_start IS NOT NULL"
+            "FROM patients WHERE alg_start IS NOT NULL AND alg_interval IS NOT NULL"
         ).fetchall()
         for r in rows:
             start = datetime.fromisoformat(r["alg_start"]).date()
@@ -1267,44 +1324,16 @@ async def aligner_and_followup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                 continue  # сегодня уже напоминали
             cap = days // r["alg_interval"] + 1
             try:
-                if cap < r["alg_total"]:
-                    await context.bot.send_message(
-                        r["chat_id"],
-                        f"😬 Сегодня меняем капу: надеваем <b>№{cap} из "
-                        f"{r['alg_total']}</b>. Так держать! 🎉",
-                        parse_mode="HTML",
-                    )
-                    conn.execute(
-                        "UPDATE patients SET alg_notified=? WHERE chat_id=?",
-                        (today.isoformat(), r["chat_id"]),
-                    )
-                elif cap == r["alg_total"]:
-                    await context.bot.send_message(
-                        r["chat_id"],
-                        f"😬 Сегодня надеваем <b>последнюю капу №{cap} из "
-                        f"{r['alg_total']}</b> — финишная прямая! 🏁",
-                        parse_mode="HTML",
-                    )
-                    conn.execute(
-                        "UPDATE patients SET alg_notified=? WHERE chat_id=?",
-                        (today.isoformat(), r["chat_id"]),
-                    )
-                else:  # график закончился
-                    await context.bot.send_message(
-                        r["chat_id"],
-                        "🎉 Ваш график элайнеров завершён! Врач расскажет о "
-                        "следующих шагах на приёме.",
-                    )
-                    conn.execute(
-                        "UPDATE patients SET alg_start=NULL, alg_notified=NULL "
-                        "WHERE chat_id=?",
-                        (r["chat_id"],),
-                    )
-                    await context.bot.send_message(
-                        DOCTOR_CHAT_ID,
-                        f"ℹ️ У пациента ID {r['chat_id']} закончился график "
-                        "элайнеров — пора планировать следующий этап.",
-                    )
+                await context.bot.send_message(
+                    r["chat_id"],
+                    f"😬 Сегодня меняем каппу: надеваем <b>№{cap}</b>. "
+                    "Так держать! 🎉",
+                    parse_mode="HTML",
+                )
+                conn.execute(
+                    "UPDATE patients SET alg_notified=? WHERE chat_id=?",
+                    (today.isoformat(), r["chat_id"]),
+                )
             except Exception as e:
                 log.warning("Элайнер-напоминание %s: %s", r["chat_id"], e)
 
@@ -1725,7 +1754,7 @@ async def setup_commands(app: Application) -> None:
                 BotCommand("stats", "Статистика по пациентам"),
                 BotCommand("brief", "Сводка на сегодня"),
                 BotCommand("setvisit", "Назначить визит: ID ДД.ММ.ГГГГ ЧЧ:ММ"),
-                BotCommand("aligners", "График элайнеров: ID интервал всего"),
+                BotCommand("aligners", "Смена капп: ID [интервал]"),
                 BotCommand("installed", "Брекеты установлены сегодня: ID"),
                 BotCommand("elastics", "Эластики вкл/выкл: ID on|off"),
                 BotCommand("retainer", "Перевести в режим ретейнеров: ID"),
@@ -1889,6 +1918,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(faq_answer, pattern=r"^faq:"))
     app.add_handler(CallbackQueryHandler(faq_back, pattern=r"^faq_list$"))
     app.add_handler(CallbackQueryHandler(wear_toggle, pattern=r"^wear:"))
+    app.add_handler(CallbackQueryHandler(aligner_interval_chosen, pattern=r"^alginterval:"))
     app.add_handler(CallbackQueryHandler(lost_chosen, pattern=r"^lost:"))
     app.add_handler(CallbackQueryHandler(rate_visit, pattern=r"^rate:"))
     app.add_handler(MessageHandler(patient & filters.PHOTO, relay_to_doctor))
