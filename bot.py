@@ -46,7 +46,39 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 # ID чата врача. Можно переопределить переменной окружения DOCTOR_CHAT_ID,
 # а если её нет — используется значение ниже. Это не секрет, в отличие от токена.
 DOCTOR_CHAT_ID = int(os.environ.get("DOCTOR_CHAT_ID", "659762090"))
-DB_PATH = "ortho_bot.db"
+def _pick_db_path() -> str:
+    """Выбирает место для базы так, чтобы она пережила передеплой.
+
+    Многие хостинги пересоздают контейнер при обновлении кода, и файл рядом
+    с ботом пропадает вместе с пациентами. Поэтому сначала ищем постоянный
+    диск (persistent volume) среди типовых путей, и только если его нет —
+    кладём базу рядом с ботом.
+    Можно задать путь явно: переменная окружения DB_PATH.
+    """
+    explicit = os.environ.get("DB_PATH")
+    if explicit:
+        os.makedirs(os.path.dirname(explicit) or ".", exist_ok=True)
+        return explicit
+
+    candidates = [
+        "/data", "/var/data", "/persistent", "/storage",
+        "/app/data", "/mnt/data", "/home/data",
+    ]
+    for d in candidates:
+        try:
+            if os.path.isdir(d) and os.access(d, os.W_OK):
+                return os.path.join(d, "ortho_bot.db")
+            # каталога нет — пробуем создать (вдруг диск примонтирован выше)
+            parent = os.path.dirname(d) or "/"
+            if os.path.isdir(parent) and os.access(parent, os.W_OK):
+                os.makedirs(d, exist_ok=True)
+                return os.path.join(d, "ortho_bot.db")
+        except Exception:
+            continue
+    return "ortho_bot.db"
+
+
+DB_PATH = _pick_db_path()
 
 # Часовой пояс пациентов относительно UTC (3 = Москва).
 # Сервер хостинга может жить по UTC, поэтому считаем время сами.
@@ -1172,7 +1204,8 @@ async def doctor_hint(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         "/elastics ID on — напоминания про эластики (или off)\n"
         "/retainer ID — перевести в режим ретейнеров (лечение окончено)\n"
         "/broadcast текст — рассылка всем пациентам\n"
-        "/backup — получить копию базы данных"
+        "/backup — получить копию базы данных\n"
+        "/dbinfo — состояние базы (сохраняются ли пациенты)"
     )
 
 
@@ -1226,6 +1259,95 @@ async def send_backup(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def weekly_backup(context: ContextTypes.DEFAULT_TYPE) -> None:
     await send_backup(context)
+
+
+async def daily_backup(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Ежедневный бэкап — страховка на случай, если хостинг сотрёт базу."""
+    now = now_local()
+    if now.hour != MORNING_BRIEF_HOUR:
+        return
+    if context.bot_data.get("backup_sent") == now.date().isoformat():
+        return
+    context.bot_data["backup_sent"] = now.date().isoformat()
+    await send_backup(context)
+
+
+async def restore_from_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Врач прислал файл базы — восстанавливаем пациентов из него.
+
+    Данные объединяются: существующие пациенты остаются, недостающие
+    добавляются из файла. Так восстановление не затирает новые записи.
+    """
+    doc = update.message.document
+    if not doc or not doc.file_name.endswith(".db"):
+        return
+    await update.message.reply_text("Принял файл, восстанавливаю данные…")
+    tmp = "/tmp/restore.db"
+    try:
+        f = await context.bot.get_file(doc.file_id)
+        await f.download_to_drive(tmp)
+    except Exception as e:
+        await update.message.reply_text(f"Не смог скачать файл: {e}")
+        return
+
+    added, updated = 0, 0
+    try:
+        src = sqlite3.connect(tmp)
+        src.row_factory = sqlite3.Row
+        rows = src.execute("SELECT * FROM patients").fetchall()
+        src_cols = [c[1] for c in src.execute("PRAGMA table_info(patients)")]
+        src.close()
+
+        with db() as conn:
+            cur_cols = [c[1] for c in conn.execute("PRAGMA table_info(patients)")]
+            common = [c for c in src_cols if c in cur_cols]
+            for r in rows:
+                exists = conn.execute(
+                    "SELECT 1 FROM patients WHERE chat_id=?", (r["chat_id"],)
+                ).fetchone()
+                data = {c: r[c] for c in common}
+                if exists:
+                    # обновляем только пустые поля, чтобы не затереть свежее
+                    sets, vals = [], []
+                    for c in common:
+                        if c == "chat_id" or data[c] is None:
+                            continue
+                        sets.append(f"{c}=COALESCE({c}, ?)")
+                        vals.append(data[c])
+                    if sets:
+                        vals.append(r["chat_id"])
+                        conn.execute(
+                            f"UPDATE patients SET {', '.join(sets)} WHERE chat_id=?",
+                            vals,
+                        )
+                        updated += 1
+                else:
+                    cols = ", ".join(common)
+                    ph = ", ".join("?" for _ in common)
+                    conn.execute(
+                        f"INSERT INTO patients ({cols}) VALUES ({ph})",
+                        [data[c] for c in common],
+                    )
+                    added += 1
+    except Exception as e:
+        await update.message.reply_text(
+            f"Не получилось прочитать базу из файла: {e}\n"
+            "Убедитесь, что это файл ortho_backup_….db от этого бота."
+        )
+        return
+    finally:
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+
+    await update.message.reply_text(
+        f"✅ Восстановление завершено.\n"
+        f"Добавлено пациентов: <b>{added}</b>\n"
+        f"Обновлено записей: <b>{updated}</b>\n\n"
+        "Проверьте список: /patients",
+        parse_mode="HTML",
+    )
 
 
 async def visit_response(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1621,6 +1743,44 @@ async def daily_care_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                         log.warning("Фото-прогресс запрос %s: %s", r["chat_id"], e)
 
 
+async def cmd_dbinfo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/dbinfo — где лежит база, сколько записей, когда создана."""
+    import time
+    lines = ["🗄 <b>Состояние базы</b>\n"]
+    lines.append(f"Файл: <code>{DB_PATH}</code>")
+    try:
+        st = os.stat(DB_PATH)
+        created = datetime.fromtimestamp(st.st_ctime) + timedelta(hours=TZ_OFFSET_HOURS)
+        size_kb = st.st_size / 1024
+        age_h = (time.time() - st.st_ctime) / 3600
+        lines.append(f"Создан: {created.strftime('%d.%m.%Y %H:%M')} "
+                     f"({age_h:.1f} ч назад)")
+        lines.append(f"Размер: {size_kb:.0f} КБ")
+    except FileNotFoundError:
+        lines.append("⚠️ Файл базы не найден!")
+    with db() as conn:
+        pc = conn.execute("SELECT COUNT(*) c FROM patients").fetchone()["c"]
+        rc = conn.execute("SELECT COUNT(*) c FROM ratings").fetchone()["c"]
+    lines.append(f"\nПациентов: <b>{pc}</b>\nОценок визитов: {rc}")
+
+    persistent = not DB_PATH.startswith("ortho_bot.db")
+    if persistent:
+        lines.append("\n✅ База на отдельном диске — должна переживать обновления.")
+    else:
+        lines.append(
+            "\n⚠️ База лежит рядом с ботом. Если хостинг пересоздаёт контейнер "
+            "при обновлении, данные могут теряться.\n"
+            "Проверка: запомните число пациентов, сделайте Redeploy и снова "
+            "отправьте /dbinfo. Если «Создан» обновилось, а пациентов стало "
+            "меньше — база стирается."
+        )
+    lines.append(
+        "\n💾 Копия базы приходит вам каждый день. Чтобы восстановить — "
+        "просто перешлите мне файл <code>ortho_backup_….db</code>."
+    )
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
 async def cmd_patients(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     with db() as conn:
         rows = conn.execute(
@@ -1918,6 +2078,7 @@ async def setup_commands(app: Application) -> None:
                 BotCommand("find", "Найти пациента: часть имени"),
                 BotCommand("stats", "Статистика по пациентам"),
                 BotCommand("brief", "Сводка на сегодня"),
+                BotCommand("dbinfo", "Состояние базы данных"),
                 BotCommand("setvisit", "Назначить визит: ID ДД.ММ.ГГГГ ЧЧ:ММ"),
                 BotCommand("aligners", "Смена капп: ID [интервал]"),
                 BotCommand("installed", "Брекеты установлены сегодня: ID"),
@@ -2064,6 +2225,7 @@ def main() -> None:
     # Врач
     app.add_handler(CommandHandler("patients", cmd_patients, filters=doctor))
     app.add_handler(CommandHandler("stats", cmd_stats, filters=doctor))
+    app.add_handler(CommandHandler("dbinfo", cmd_dbinfo, filters=doctor))
     app.add_handler(CommandHandler("brief", cmd_brief, filters=doctor))
     app.add_handler(CommandHandler("find", cmd_find, filters=doctor))
     app.add_handler(CommandHandler("setvisit", cmd_setvisit, filters=doctor))
@@ -2074,6 +2236,7 @@ def main() -> None:
     app.add_handler(CommandHandler("retainer", cmd_retainer, filters=doctor))
     app.add_handler(CommandHandler("elastics", cmd_elastics, filters=doctor))
     app.add_handler(CallbackQueryHandler(visit_response, pattern=r"^visit:"))
+    app.add_handler(MessageHandler(doctor & filters.Document.ALL, restore_from_file))
     app.add_handler(MessageHandler(doctor & filters.REPLY, doctor_reply))
     app.add_handler(MessageHandler(doctor & ~filters.COMMAND, doctor_hint))
 
@@ -2097,7 +2260,7 @@ def main() -> None:
     # Эластики, ретейнеры, фото-прогресс, контроль ношения капп
     app.job_queue.run_repeating(daily_care_job, interval=3600, first=45)
     # Еженедельный бэкап базы врачу в Telegram (раз в 7 дней)
-    app.job_queue.run_repeating(weekly_backup, interval=7 * 24 * 3600, first=60)
+    app.job_queue.run_repeating(daily_backup, interval=1800, first=90)
     # Утренняя сводка врачу (проверяет час внутри, шлёт раз в день)
     app.job_queue.run_repeating(morning_brief_job, interval=1800, first=50)
 
