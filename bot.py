@@ -294,45 +294,182 @@ MEMO_TEXT = (
     "Вопросы — прямо здесь в боте 💬"
 )
 
-# ─── Списки покупок (ссылки на Озон) ───
-# Сейчас это ссылки на поиск — они не протухают.
-# Можно заменить на ссылки конкретных проверенных товаров:
-# просто вставьте URL товара вместо поисковой ссылки.
+# ─── Каталог средств гигиены (подборка врача, ссылки на Озон) ───
+# Категории → список ссылок. Пациент выбирает категорию и видит варианты.
+# Чтобы добавить/убрать товар — просто правьте списки ниже.
 
-def ozon(query: str) -> str:
-    from urllib.parse import quote_plus
-    return f"https://www.ozon.ru/search/?text={quote_plus(query)}"
+SHOP_CATALOG: dict[str, dict] = {
+    "brushes_v": {
+        "title": "🪥 Щётки с вырезом под брекеты",
+        "note": "Основная щётка при брекетах: V-вырез чистит над и под дугой.",
+        "links": [
+            "https://ozon.ru/t/UuomPob",
+            "https://ozon.ru/t/fBOht7n",
+            "https://ozon.ru/t/j7ZKEai",
+        ],
+    },
+    "brushes_mono": {
+        "title": "🖌 Монопучковые щётки",
+        "note": "Для чистки вокруг каждого замка и у линии десны.",
+        "links": [
+            "https://ozon.ru/t/IYLooan",
+            "https://ozon.ru/t/hiJRGzG",
+            "https://ozon.ru/t/tPcq9f5",
+            "https://ozon.ru/t/hiJRdZi",
+        ],
+    },
+    "brushes_inter": {
+        "title": "🧹 Ёршики межзубные",
+        "note": "Чистят под дугой между брекетами.",
+        "links": ["https://ozon.ru/t/3QXCoXz"],
+    },
+    "brushes_electric": {
+        "title": "⚡ Электрическая щётка",
+        "links": ["https://ozon.ru/t/RhSeCi0"],
+    },
+    "sets_ortho": {
+        "title": "🎁 Ортодонтические наборы",
+        "note": "Удобно взять всё сразу одним комплектом.",
+        "links": [
+            "https://ozon.ru/t/qtWHKnt",
+            "https://ozon.ru/t/D4i53HI",
+        ],
+    },
+    "sets_travel": {
+        "title": "🧳 Дорожные наборы",
+        "note": "Чтобы чистить зубы после еды вне дома.",
+        "links": [
+            "https://ozon.ru/t/r9YubHq",
+            "https://ozon.ru/t/CrILw2b",
+        ],
+    },
+    "paste": {
+        "title": "🦷 Зубные пасты",
+        "links": [
+            "https://ozon.ru/t/3QXtTP5",
+            "https://ozon.ru/t/AxMiFQS",
+            "https://ozon.ru/t/qtWH2Yq",
+            "https://ozon.ru/t/Oy1T2Dp",
+            "https://ozon.ru/t/l1b6RpN",
+            "https://ozon.ru/t/2zdbBO3",
+        ],
+    },
+    "foam": {
+        "title": "🫧 Пенки для полости рта",
+        "note": "Выручают, когда нет возможности почистить зубы щёткой.",
+        "links": [
+            "https://ozon.ru/t/CrIUSh5",
+            "https://ozon.ru/t/l1beO2x",
+            "https://ozon.ru/t/6lxLuil",
+            "https://ozon.ru/t/gmrsBKI",
+        ],
+    },
+    "irrigator": {
+        "title": "💦 Ирригаторы",
+        "note": "Лучший друг брекетоносца — вымывает то, что не достала щётка.",
+        "links": [
+            "https://ozon.ru/t/MnG86Mx",
+            "https://ozon.ru/t/8M7aRVF",
+            "https://ozon.ru/t/QWp36bw",
+            "https://ozon.ru/t/j7ZKCXu",
+            "https://ozon.ru/t/1fTlriZ",
+        ],
+    },
+    "irrigator_liquid": {
+        "title": "🧴 Жидкость для ирригатора",
+        "links": [
+            "https://ozon.ru/t/4KvqEL1",
+            "https://ozon.ru/t/dwV6XA2",
+            "https://ozon.ru/t/a8jVkIe",
+        ],
+    },
+    "floss": {
+        "title": "🧵 Зубная нить",
+        "links": [
+            "https://ozon.ru/t/iv5Qfkc",
+            "https://ozon.ru/t/yefODVH",
+            "https://ozon.ru/t/cFqG00k",
+            "https://ozon.ru/t/cFqExV3",
+        ],
+    },
+    "indicator": {
+        "title": "🔎 Индикатор налёта",
+        "note": "Окрашивает налёт — сразу видно, что вы пропустили при чистке.",
+        "links": [
+            "https://ozon.ru/t/EIz1Szy",
+            "https://ozon.ru/t/EIz1I7S",
+            "https://ozon.ru/t/j7ZP7qC",
+        ],
+    },
+    "wax": {
+        "title": "🕯 Ортодонтический воск",
+        "note": "Если брекет или дуга натирают — прикройте воском.",
+        "links": [
+            "https://ozon.ru/t/8M72ykj",
+            "https://ozon.ru/t/4KvqR6a",
+        ],
+    },
+    "container": {
+        "title": "📦 Контейнеры для элайнеров и пластин",
+        "note": "Храним каппы только в контейнере — не в салфетке!",
+        "links": [
+            "https://ozon.ru/t/HqQayIR",
+            "https://ozon.ru/t/1fT9ssv",
+        ],
+    },
+    "other": {
+        "title": "✨ Прочее",
+        "note": "Разное полезное для ухода.",
+        "links": [
+            "https://ozon.ru/t/dwV65a8", "https://ozon.ru/t/tPcMbgV",
+            "https://ozon.ru/t/n6ALqxz", "https://ozon.ru/t/qtW85h0",
+            "https://ozon.ru/t/wE2lUgc", "https://ozon.ru/t/AxMEd9u",
+            "https://ozon.ru/t/dwV6eLm", "https://ozon.ru/t/9ogRr5C",
+            "https://ozon.ru/t/cFqG1C5", "https://ozon.ru/t/fBOoiJj",
+            "https://ozon.ru/t/5DhppXQ", "https://ozon.ru/t/dwV6RFw",
+            "https://ozon.ru/t/J5RZ2r6", "https://ozon.ru/t/QWpdoIL",
+            "https://ozon.ru/t/tPcLeTW", "https://ozon.ru/t/dwVriIe",
+        ],
+    },
+}
 
-
-SHOP_BRACES: list[tuple[str, str]] = [
-    ("Ортодонтическая щётка (V-вырез)", ozon("ортодонтическая зубная щетка V-образная")),
-    ("Монопучковая щётка", ozon("монопучковая зубная щетка")),
-    ("Ёршики межзубные для брекетов", ozon("ершики для брекетов межзубные")),
-    ("Ортодонтический воск", ozon("ортодонтический воск для брекетов")),
-    ("Ирригатор", ozon("ирригатор для полости рта")),
-    ("Ополаскиватель с фтором", ozon("ополаскиватель для рта с фторидом")),
+# Какие категории показывать в первую очередь — зависит от аппарата
+SHOP_ORDER_BRACES = [
+    "brushes_v", "brushes_mono", "brushes_inter", "wax", "irrigator",
+    "irrigator_liquid", "floss", "paste", "foam", "indicator",
+    "sets_ortho", "sets_travel", "brushes_electric", "other",
+]
+SHOP_ORDER_ALIGNERS = [
+    "container", "brushes_mono", "paste", "floss", "irrigator",
+    "irrigator_liquid", "foam", "indicator", "sets_travel",
+    "brushes_electric", "sets_ortho", "other",
 ]
 
-SHOP_ALIGNERS: list[tuple[str, str]] = [
-    ("Контейнер для элайнеров", ozon("контейнер для элайнеров кейс")),
-    ("Таблетки для очистки капп", ozon("таблетки для очистки элайнеров капп")),
-    ("Зубная щётка мягкая", ozon("зубная щетка мягкая soft")),
-    ("Зубная нить", ozon("зубная нить флосс")),
-    ("Ирригатор", ozon("ирригатор для полости рта")),
-    ("Дорожный набор гигиены", ozon("дорожный набор зубная щетка паста")),
-]
+
+def shop_keyboard(appliance: str | None) -> InlineKeyboardMarkup:
+    """Меню категорий — по две кнопки в ряд."""
+    order = SHOP_ORDER_ALIGNERS if appliance == "aligners" else SHOP_ORDER_BRACES
+    rows, row = [], []
+    for key in order:
+        row.append(InlineKeyboardButton(
+            SHOP_CATALOG[key]["title"], callback_data=f"shop:{key}"
+        ))
+        if len(row) == 1:  # по одной в ряд — названия длинные
+            rows.append(row); row = []
+    if row:
+        rows.append(row)
+    return InlineKeyboardMarkup(rows)
 
 
-def shop_text(appliance: str) -> str:
-    items = SHOP_BRACES if appliance == "braces" else SHOP_ALIGNERS
-    title = "брекетов" if appliance == "braces" else "элайнеров"
-    lines = [f"🛒 <b>Что купить для ухода — набор для {title}:</b>\n"]
-    for name, url in items:
-        lines.append(f"• <a href='{url}'>{name}</a>")
-    lines.append(
-        "\n💡 Ссылки ведут на подборки Озона. Если сомневаетесь в выборе "
-        "конкретной модели — спросите меня, передам вопрос врачу."
-    )
+def shop_category_text(key: str) -> str:
+    cat = SHOP_CATALOG[key]
+    lines = [f"<b>{cat['title']}</b>"]
+    if cat.get("note"):
+        lines.append(f"<i>{cat['note']}</i>")
+    lines.append("")
+    for i, url in enumerate(cat["links"], 1):
+        lines.append(f"{i}. {url}")
+    lines.append("\n💡 Это подборка вашего врача. Любой вариант из списка подойдёт.")
     return "\n".join(lines)
 
 
@@ -465,9 +602,10 @@ async def appliance_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     except Exception:
         pass
     await query.message.reply_text(
-        shop_text(appliance),
+        "🛒 <b>Средства гигиены — подборка вашего врача</b>\n\n"
+        "Выберите категорию, чтобы посмотреть варианты:",
         parse_mode="HTML",
-        disable_web_page_preview=True,
+        reply_markup=shop_keyboard(appliance),
     )
     if appliance == "aligners":
         await query.message.reply_text(
@@ -478,23 +616,50 @@ async def appliance_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 async def show_shop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Кнопка меню «Что купить» — с учётом сохранённого выбора."""
+    """Кнопка меню «Что купить» — каталог категорий."""
     with db() as conn:
         row = conn.execute(
             "SELECT appliance FROM patients WHERE chat_id=?",
             (update.effective_chat.id,),
         ).fetchone()
-    if row and row["appliance"]:
-        await update.message.reply_text(
-            shop_text(row["appliance"]),
+    appliance = row["appliance"] if row else None
+    await update.message.reply_text(
+        "🛒 <b>Средства гигиены — подборка вашего врача</b>\n\n"
+        "Выберите категорию:",
+        parse_mode="HTML",
+        reply_markup=shop_keyboard(appliance),
+    )
+
+
+async def shop_category(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Пациент выбрал категорию — показываем ссылки."""
+    query = update.callback_query
+    await query.answer()
+    key = query.data.split(":", 1)[1]
+    if key == "back":
+        with db() as conn:
+            row = conn.execute(
+                "SELECT appliance FROM patients WHERE chat_id=?",
+                (query.message.chat_id,),
+            ).fetchone()
+        await query.edit_message_text(
+            "🛒 <b>Средства гигиены — подборка вашего врача</b>\n\n"
+            "Выберите категорию:",
             parse_mode="HTML",
-            disable_web_page_preview=True,
+            reply_markup=shop_keyboard(row["appliance"] if row else None),
         )
-    else:
-        await update.message.reply_text(
-            "Сначала подскажите — что вам установили?",
-            reply_markup=APPLIANCE_KEYBOARD,
-        )
+        return
+    if key not in SHOP_CATALOG:
+        return
+    back = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("← К категориям", callback_data="shop:back")]]
+    )
+    await query.edit_message_text(
+        shop_category_text(key),
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+        reply_markup=back,
+    )
 
 
 async def show_faq(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1917,6 +2082,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(appliance_chosen, pattern=r"^appl:"))
     app.add_handler(CallbackQueryHandler(faq_answer, pattern=r"^faq:"))
     app.add_handler(CallbackQueryHandler(faq_back, pattern=r"^faq_list$"))
+    app.add_handler(CallbackQueryHandler(shop_category, pattern=r"^shop:"))
     app.add_handler(CallbackQueryHandler(wear_toggle, pattern=r"^wear:"))
     app.add_handler(CallbackQueryHandler(aligner_interval_chosen, pattern=r"^alginterval:"))
     app.add_handler(CallbackQueryHandler(lost_chosen, pattern=r"^lost:"))
